@@ -6,8 +6,9 @@ from arq.connections import RedisSettings
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import health, ingest
+from app.api.v1 import health, ingest, respond
 from app.config import settings
+from app.db import close_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ async def lifespan(app: FastAPI):
         if app.state.arq_redis is not None:
             await app.state.arq_redis.close()
             logger.info("arq redis pool closed")
+        await close_redis_client()
 
 
 app = FastAPI(title="InboxAI Brain", version="0.1.0", lifespan=lifespan)
@@ -40,6 +42,7 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(ingest.router)
+app.include_router(respond.router)
 
 
 @app.get("/")

@@ -1,3 +1,4 @@
+from app.models.audit_logs import AuditLog
 from app.models.base import Base, TimestampMixin
 from app.models.brain_chunks import BrainChunk
 from app.models.brain_customer_memory import BrainCustomerMemory
@@ -13,6 +14,7 @@ from app.models.brain_summaries import BrainSummary
 from app.models.brain_tuning_changes import BrainTuningChange
 
 __all__ = [
+    "AuditLog",
     "Base",
     "TimestampMixin",
     "BrainChunk",
