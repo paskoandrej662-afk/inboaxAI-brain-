@@ -25,6 +25,7 @@ class BrainChunk(Base, TimestampMixin):
     source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_type: Mapped[str | None] = mapped_column(Text, nullable=True)
     section: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
     meta: Mapped[dict] = mapped_column(JSONB, server_default=sa_text("'{}'::jsonb"), nullable=False)
     superseded_at: Mapped[datetime | None] = mapped_column(
@@ -44,4 +45,11 @@ class BrainChunk(Base, TimestampMixin):
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
         Index("ix_brain_chunks_company_superseded", "company_id", "superseded_at"),
+        Index(
+            "uq_brain_chunks_company_hash_active",
+            "company_id",
+            "content_hash",
+            unique=True,
+            postgresql_where=sa_text("superseded_at IS NULL"),
+        ),
     )
