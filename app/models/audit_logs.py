@@ -22,6 +22,7 @@ class AuditLog(Base):
 
     query: Mapped[str | None] = mapped_column(Text, nullable=True)
     route: Mapped[str | None] = mapped_column(Text, nullable=True)
+    intent: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     retrieved_chunk_ids: Mapped[list[uuid.UUID] | None] = mapped_column(
         ARRAY(UUID(as_uuid=True)), nullable=True
@@ -45,6 +46,13 @@ class AuditLog(Base):
         JSONB, server_default=text("'{}'::jsonb"), nullable=False
     )
 
+    proposal_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proposal: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    diff_before: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    diff_after: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    actor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -54,5 +62,12 @@ class AuditLog(Base):
             "ix_audit_logs_company_created",
             "company_id",
             text("created_at DESC"),
+        ),
+        Index(
+            "uq_audit_logs_company_proposal_hash",
+            "company_id",
+            "proposal_hash",
+            unique=True,
+            postgresql_where=text("proposal_hash IS NOT NULL"),
         ),
     )
