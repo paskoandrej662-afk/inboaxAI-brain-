@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        app.state.arq_redis = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+        app.state.arq_redis = await create_pool(RedisSettings.from_dsn(settings.effective_redis_url))
         logger.info("arq redis pool initialized")
     except Exception as exc:
         logger.exception("failed to initialize arq redis pool: %s", exc)
@@ -49,3 +49,9 @@ app.include_router(coach.router)
 @app.get("/")
 async def root() -> dict[str, str]:
     return {"name": "InboxAI Brain", "version": "0.1.0"}
+
+
+@app.get("/health", tags=["meta"])
+async def liveness():
+    """Railway liveness probe - shallow check, no DB."""
+    return {"status": "alive"}

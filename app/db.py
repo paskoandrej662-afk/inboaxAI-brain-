@@ -13,10 +13,21 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+db_url = settings.effective_database_url
+connect_args: dict = {}
+if "pooler.supabase.com" in db_url:
+    connect_args = {
+        "statement_cache_size": 0,
+        "prepared_statement_cache_size": 0,
+    }
+
 engine = create_async_engine(
-    settings.database_url,
-    echo=False,
+    db_url,
+    connect_args=connect_args,
     pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=5,
+    echo=False,
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -45,7 +56,7 @@ async def get_redis_client() -> redis_async.Redis:
     global _redis_client
     if _redis_client is None:
         _redis_client = redis_async.from_url(
-            settings.REDIS_URL,
+            settings.effective_redis_url,
             encoding="utf-8",
             decode_responses=True,
         )

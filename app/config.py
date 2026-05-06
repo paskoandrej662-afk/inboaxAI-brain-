@@ -1,3 +1,5 @@
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,6 +38,26 @@ class Settings(BaseSettings):
         if self.ENVIRONMENT == "production":
             return self.DATABASE_URL_SUPABASE
         return self.DATABASE_URL_LOCAL
+
+    @property
+    def effective_database_url(self) -> str:
+        """Priority: env DATABASE_URL > production Supabase > local Docker."""
+        env_override = os.environ.get("DATABASE_URL")
+        if env_override:
+            return env_override
+        if self.ENVIRONMENT == "production":
+            if not self.DATABASE_URL_SUPABASE:
+                raise RuntimeError(
+                    "ENVIRONMENT=production but DATABASE_URL_SUPABASE is empty. "
+                    "Set DATABASE_URL in Railway env vars."
+                )
+            return self.DATABASE_URL_SUPABASE
+        return self.DATABASE_URL_LOCAL
+
+    @property
+    def effective_redis_url(self) -> str:
+        """Priority: env REDIS_URL > self.REDIS_URL."""
+        return os.environ.get("REDIS_URL") or self.REDIS_URL
 
 
 settings = Settings()
