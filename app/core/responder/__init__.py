@@ -19,9 +19,11 @@ from app.core.responder.generator import (
     generate_response,
 )
 from app.core.responder.handoff import detect_handoff_signals, detect_prompt_injection
+from app.core.responder.history_loader import load_conversation_history
 from app.core.responder.prompt_builder import build_system_prompt
 from app.core.responder.retrieval import RetrievalContext, retrieve_context
 from app.core.responder.router import classify_route
+from app.core.responder.summarizer import conversation_id_for, get_or_create_summary
 from app.db import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
@@ -152,8 +154,45 @@ async def respond(
             query[:120],
         )
 
+    # 0. Conversation history: prefer request body; fall back to DB lookup if short/empty.
+    request_history = history or []
+    history_source = "request_body"
+    if len(request_history) < 3:
+        loaded = await load_conversation_history(
+            company_id=company_id,
+            customer_id=customer_id,
+            channel=channel,
+            limit=10,
+        )
+        if loaded:
+            request_history = loaded
+            history_source = "db_lookup"
+
+    summary: str | None = None
+    if len(request_history) > 20 and customer_id and channel:
+        try:
+            summary = await get_or_create_summary(
+                company_id=company_id,
+                conversation_id=conversation_id_for(customer_id, channel),
+                messages=request_history,
+            )
+            if summary:
+                history_source = "summary_extended"
+        except Exception as exc:
+            logger.warning("summary path failed: %s", exc)
+
+    effective_history = request_history[-10:]
+    logger.info(
+        "history loaded: source=%s len=%d summary=%s company=%s customer=%s",
+        history_source,
+        len(effective_history),
+        bool(summary),
+        company_id,
+        customer_id,
+    )
+
     # 1. Parallel: route classifier + query embedding
-    route_task = asyncio.create_task(_route_or_fallback(query, history))
+    route_task = asyncio.create_task(_route_or_fallback(query, effective_history))
     embed_task = asyncio.create_task(_embed_or_fallback(query))
     route, query_vec = await asyncio.gather(route_task, embed_task)
 
@@ -172,14 +211,15 @@ async def respond(
         persona=context.persona,
         chunks=context.chunks,
         facts=context.facts,
-        history=history,
+        history=effective_history,
         current_time=datetime.now(timezone.utc),
         company_name=_safe_default_persona_company_name(company_id),
         route=route,
+        summary=summary,
     )
 
     # 4. Generation
-    output = await generate_response(context, query, history, system_prompt)
+    output = await generate_response(context, query, effective_history, system_prompt)
 
     # 5. Handoff overlay
     if detect_handoff_signals(query, route):
@@ -194,6 +234,9 @@ async def respond(
     if route in ("qa", "unknown") and not output.used_chunk_ids:
         output.needs_human = True
         output.flags.setdefault("no_grounded_citation", True)
+
+    output.flags["history_source"] = history_source
+    output.flags["history_len"] = len(effective_history)
 
     latency_ms = int((time.monotonic() - started) * 1000)
 

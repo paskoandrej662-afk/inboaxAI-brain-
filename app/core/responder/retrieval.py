@@ -64,7 +64,23 @@ def _vec_literal(vector: list[float]) -> str:
 
 
 async def _load_persona(company_id: uuid.UUID) -> Persona:
-    cache_key = f"persona:{company_id}"
+    # Look up the current persona version to build a race-free cache key.
+    async with AsyncSessionLocal() as session:
+        row = (
+            await session.execute(
+                sa_text(
+                    "SELECT version, tone, addressing, language, emoji_use, length_preference, rules, negative_facts "
+                    "FROM brain_persona WHERE company_id = :cid LIMIT 1"
+                ),
+                {"cid": str(company_id)},
+            )
+        ).first()
+
+    if row is None:
+        return Persona(company_id=company_id)
+
+    version = int(row[0] or 1)
+    cache_key = f"persona:{company_id}:v{version}"
     cached = await cache_get(cache_key)
     if cached:
         try:
@@ -82,30 +98,16 @@ async def _load_persona(company_id: uuid.UUID) -> Persona:
         except Exception as exc:
             logger.warning("persona cache parse failed: %s", exc)
 
-    async with AsyncSessionLocal() as session:
-        row = (
-            await session.execute(
-                sa_text(
-                    "SELECT tone, addressing, language, emoji_use, length_preference, rules, negative_facts "
-                    "FROM brain_persona WHERE company_id = :cid LIMIT 1"
-                ),
-                {"cid": str(company_id)},
-            )
-        ).first()
-
-    if row is None:
-        persona = Persona(company_id=company_id)
-    else:
-        persona = Persona(
-            company_id=company_id,
-            tone=row[0] or "friendly",
-            addressing=row[1] or "tykanie",
-            language=row[2] or "sk",
-            emoji_use=row[3] or "sometimes",
-            length_preference=row[4] or "medium",
-            rules=list(row[5]) if row[5] else [],
-            negative_facts=list(row[6]) if row[6] else [],
-        )
+    persona = Persona(
+        company_id=company_id,
+        tone=row[1] or "friendly",
+        addressing=row[2] or "tykanie",
+        language=row[3] or "sk",
+        emoji_use=row[4] or "sometimes",
+        length_preference=row[5] or "medium",
+        rules=list(row[6]) if row[6] else [],
+        negative_facts=list(row[7]) if row[7] else [],
+    )
 
     await cache_set(
         cache_key,

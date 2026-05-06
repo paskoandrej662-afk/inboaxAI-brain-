@@ -102,6 +102,7 @@ def build_system_prompt(
     *,
     company_name: str | None = None,
     route: str | None = None,
+    summary: str | None = None,
 ) -> str:
     name = company_name or "firma"
     addressing_note = _ADDRESSING_NOTE.get(persona.addressing, _ADDRESSING_NOTE["tykanie"])
@@ -120,6 +121,11 @@ def build_system_prompt(
     )
 
     history_block = _format_history(history)
+    if summary:
+        history_block = (
+            f"PREDCHÁDZAJÚCA KONVERZÁCIA (zhrnutie):\n{summary.strip()}\n\n"
+            f"POSLEDNÉ SPRÁVY:\n{history_block}"
+        )
     chunks_block = _format_chunks(chunks)
     facts_block = _format_facts(facts)
     time_str = current_time.strftime("%Y-%m-%d %H:%M (%A)")
