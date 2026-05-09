@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json as _json
 import logging
+import re
 import traceback
 import uuid
 from dataclasses import dataclass, field
@@ -13,7 +15,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.core.chunker import Chunk, chunk_text, normalize_text
+from app.core.chunker import Chunk, chunk_text, compute_hash, normalize_text
 from app.core.embeddings import embed_batch
 from app.core.extractor import (
     ExtractedFact,
@@ -42,9 +44,16 @@ class IngestResult:
     pages_scraped: int = 0
     pages_failed: int = 0
     errors: list[str] = field(default_factory=list)
+    # Phase 1C additions (optional, backward compat)
+    pages_visited: int = 0
+    pages_succeeded: int = 0
+    products_inserted: int = 0
+    images_inserted: int = 0
+    total_llm_cost_usd: float = 0.0
+    extraction_run_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "chunks": self.chunks_inserted,
             "chunks_skipped": self.chunks_skipped,
             "chunks_superseded": self.chunks_superseded,
@@ -54,6 +63,19 @@ class IngestResult:
             "pages_failed": self.pages_failed,
             "errors": self.errors[:5],
         }
+        if self.pages_visited:
+            out["pages_visited"] = self.pages_visited
+        if self.pages_succeeded:
+            out["pages_succeeded"] = self.pages_succeeded
+        if self.products_inserted:
+            out["products"] = self.products_inserted
+        if self.images_inserted:
+            out["images"] = self.images_inserted
+        if self.total_llm_cost_usd:
+            out["llm_cost_usd"] = round(self.total_llm_cost_usd, 4)
+        if self.extraction_run_id:
+            out["extraction_run_id"] = self.extraction_run_id
+        return out
 
 
 async def _set_job(
@@ -75,8 +97,6 @@ async def _set_job(
         params["progress"] = progress
     if result is not None:
         sets.append("result = CAST(:result AS jsonb)")
-        import json as _json
-
         params["result"] = _json.dumps(result, ensure_ascii=False)
     if error is not None:
         sets.append("error = :error")
@@ -92,8 +112,734 @@ async def _update_progress(job_id: str, progress: int, status: str = "running") 
         await _set_job(session, job_id, status=status, progress=progress)
 
 
-async def ingest_url(company_id: uuid.UUID, url: str, job_id: str, max_pages: int = 30) -> IngestResult:
-    """Run the full ingestion pipeline for one start URL. Updates brain_jobs in real time."""
+# ───────────────────────────────────────────────────
+# Public entry point — dispatcher
+# ───────────────────────────────────────────────────
+
+
+async def ingest_url(
+    company_id: uuid.UUID, url: str, job_id: str, max_pages: int = 30
+) -> IngestResult:
+    """Run the full ingestion pipeline for one start URL. Updates brain_jobs in real time.
+
+    Dispatches to vision-based pipeline if VISION_INGEST_ENABLED, else legacy text-only path.
+    """
+    if not settings.VISION_INGEST_ENABLED:
+        return await _ingest_url_legacy(company_id, url, job_id, max_pages)
+
+    return await _ingest_url_vision(company_id, url, job_id, max_pages)
+
+
+# ───────────────────────────────────────────────────
+# New vision-based pipeline (Phase 1C)
+# ───────────────────────────────────────────────────
+
+
+async def _ingest_url_vision(
+    company_id: uuid.UUID, url: str, job_id: str, max_pages: int = 30
+) -> IngestResult:
+    """Vision-based ingest using BrowserPool + html_structured + classifier + vision + verification + merger."""
+    # Lazy imports — keep the legacy path lean and avoid Playwright import on cold legacy fallback.
+    from app.core.browser import BrowserPool
+    from app.core.extractors.classifier import classify_page
+    from app.core.extractors.html_structured import (
+        extract_contact_patterns,
+        extract_image_refs,
+        extract_jsonld_business,
+        extract_jsonld_faq,
+        extract_jsonld_products,
+    )
+    from app.core.extractors.merger import (
+        merge_facts,
+        merge_faqs,
+        merge_images,
+        merge_products,
+    )
+    from app.core.extractors.verification import verify_fact, verify_product
+    from app.core.extractors.vision import extract_page_with_vision
+    from app.core.scraper import discover_pages as legacy_discover_pages
+
+    result = IngestResult()
+
+    try:
+        await _update_progress(job_id, 0, "running")
+
+        # 1. Discover pages
+        try:
+            pages = await legacy_discover_pages(url, max_pages=max_pages)
+        except Exception as e:
+            logger.warning("discover_pages failed: %s — using only start URL", e)
+            pages = [url]
+        pages = pages[:max_pages]
+        total = len(pages) or 1
+        logger.info("ingest_url: discovered %d pages for %s", len(pages), url)
+
+        # 2. Init browser
+        browser = BrowserPool()
+        try:
+            await browser.start()
+        except Exception as e:
+            logger.warning(
+                "BrowserPool start failed: %s — falling back to legacy ingest", e
+            )
+            return await _ingest_url_legacy(company_id, url, job_id, max_pages)
+
+        all_products: list = []
+        all_facts: list = []
+        all_faqs: list = []
+        all_images: list = []
+        all_chunks_text_tuples: list[tuple[str, str, str]] = []
+        total_cost_usd = 0.0
+
+        try:
+            for i, page_url in enumerate(pages):
+                try:
+                    await _update_progress(job_id, int((i / total) * 90))
+
+                    rendered = await browser.render_page(
+                        page_url, take_screenshot=True
+                    )
+                    if rendered.error:
+                        result.errors.append(f"render {page_url}: {rendered.error}")
+                        result.pages_failed += 1
+                        continue
+                    result.pages_visited += 1
+
+                    try:
+                        content = extract_text(rendered.html, rendered.final_url)
+                        raw_text = content.text or ""
+                        title = content.title or ""
+                        section_hint = content.section
+                    except Exception:
+                        raw_text = ""
+                        title = ""
+                        section_hint = "general"
+
+                    try:
+                        page_type, value_score = await classify_page(
+                            page_url, title, raw_text[:600]
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "classify_page failed for %s: %s", page_url, e
+                        )
+                        page_type, value_score = "other_low_value", 0.3
+
+                    if page_type == "other_low_value" and value_score < 0.2:
+                        logger.info("skipping low-value page: %s", page_url)
+                        continue
+
+                    html_products = extract_jsonld_products(
+                        rendered.html, rendered.final_url
+                    )
+                    html_faqs = extract_jsonld_faq(rendered.html, rendered.final_url)
+                    html_business = extract_jsonld_business(
+                        rendered.html, rendered.final_url
+                    )
+                    html_business += extract_contact_patterns(
+                        raw_text, rendered.final_url
+                    )
+                    html_images = extract_image_refs(rendered.html, rendered.final_url)
+
+                    use_vision = (
+                        rendered.screenshot_png is not None
+                        and page_type
+                        in {
+                            "product_listing",
+                            "product_detail",
+                            "service_pricing",
+                            "faq",
+                            "home",
+                            "about",
+                            "contact",
+                        }
+                        and total_cost_usd < settings.INGEST_LLM_COST_CAP_USD
+                    )
+
+                    vp: list = []
+                    vf: list = []
+                    vfq: list = []
+                    vi: list = []
+                    summary = ""
+                    cost = 0.0
+                    if use_vision:
+                        (
+                            vp,
+                            vf,
+                            vfq,
+                            vi,
+                            summary,
+                            cost,
+                        ) = await extract_page_with_vision(
+                            rendered, page_type, raw_text
+                        )
+                        total_cost_usd += cost
+
+                        vp = [verify_product(p, raw_text) for p in vp]
+                        verified_facts = []
+                        for f in vf:
+                            vf2 = verify_fact(f, raw_text)
+                            if vf2 is not None:
+                                verified_facts.append(vf2)
+                        vf = verified_facts
+
+                    page_products = merge_products(html_products, vp)
+                    page_facts = merge_facts(html_business, vf)
+                    page_faqs = merge_faqs(html_faqs, vfq)
+
+                    all_products.extend(page_products)
+                    all_facts.extend(page_facts)
+                    all_faqs.extend(page_faqs)
+                    all_images.extend(html_images + vi)
+
+                    if raw_text:
+                        all_chunks_text_tuples.append(
+                            (raw_text, rendered.final_url, section_hint)
+                        )
+
+                    result.pages_succeeded += 1
+
+                except Exception as e:
+                    logger.exception(
+                        "page processing error for %s: %s", page_url, e
+                    )
+                    result.errors.append(f"page {page_url}: {str(e)[:200]}")
+                    result.pages_failed += 1
+
+        finally:
+            await browser.close()
+
+        # Cross-page dedupe
+        all_products = merge_products(all_products)
+        all_facts = merge_facts(all_facts)
+        all_faqs = merge_faqs(all_faqs)
+        all_images = merge_images(all_images)
+
+        # Backward-compat: legacy field used by callers / dashboards
+        result.pages_scraped = result.pages_succeeded
+        result.total_llm_cost_usd = total_cost_usd
+
+        logger.info(
+            "ingest_url done: %d products, %d facts, %d faqs, %d images, cost=$%.4f",
+            len(all_products),
+            len(all_facts),
+            len(all_faqs),
+            len(all_images),
+            total_cost_usd,
+        )
+
+        await _update_progress(job_id, 92)
+
+        # Persistence
+        if settings.KNOWLEDGE_REVIEW_ENABLED:
+            run_id = await _persist_to_extraction_runs(
+                company_id,
+                job_id,
+                url,
+                all_products,
+                all_facts,
+                all_faqs,
+                all_images,
+                total_cost_usd,
+                result,
+            )
+            result.extraction_run_id = run_id
+        else:
+            await _persist_to_brain_tables(
+                company_id,
+                all_products,
+                all_facts,
+                all_faqs,
+                all_chunks_text_tuples,
+                result,
+            )
+
+        async with AsyncSessionLocal() as session:
+            await _set_job(
+                session,
+                job_id,
+                status="done",
+                progress=100,
+                result=result.to_dict(),
+            )
+        return result
+
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.exception("ingest_url (vision) failed for %s", url)
+        try:
+            async with AsyncSessionLocal() as session:
+                await _set_job(
+                    session,
+                    job_id,
+                    status="failed",
+                    error=f"{exc}\n{tb}"[:4000],
+                    result=result.to_dict(),
+                )
+        except Exception:
+            logger.exception("failed to update brain_jobs on error")
+        raise
+
+
+# ───────────────────────────────────────────────────
+# Persistence helpers
+# ───────────────────────────────────────────────────
+
+
+def _normalize_subject(key: str, value: str) -> str:
+    """Normalize fact subject for upsert key. Mirrors legacy extractor.extract_facts behaviour."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if key == "phone":
+        return re.sub(r"\D", "", v)
+    if key == "email":
+        return v.lower()
+    if key == "ico":
+        return re.sub(r"\D", "", v)
+    if key == "iban":
+        return re.sub(r"\s+", "", v).upper()
+    return v[:120].lower()
+
+
+def _serialize_product_text(p: Any) -> str:
+    """Render a product into a single chunk-friendly text body."""
+    parts: list[str] = [str(p.name).strip()]
+    if p.description:
+        parts.append(str(p.description).strip())
+    if p.price_text:
+        parts.append(f"Cena: {p.price_text}")
+    if p.price_unit and p.price_unit != "neuvedene":
+        parts.append(f"Jednotka: {p.price_unit}")
+    if p.attributes:
+        for k, v in p.attributes.items():
+            parts.append(f"{k}: {v}")
+    if p.image_url:
+        parts.append(f"Obrazok: {p.image_url}")
+    return "\n".join(parts).strip()
+
+
+async def _persist_to_brain_tables(
+    company_id: uuid.UUID,
+    products: list,
+    facts: list,
+    faqs: list,
+    chunks_text_tuples: list[tuple[str, str, str]],
+    result: IngestResult,
+) -> None:
+    """Direct save to brain_chunks/brain_facts/brain_faqs (legacy production path)."""
+    # 1) Build product chunks
+    product_chunk_specs: list[tuple[str, str, str, str, dict]] = []
+    # (text, content_hash, source_url, section, meta)
+    for p in products:
+        body = _serialize_product_text(p)
+        if not body or len(body) < 5:
+            continue
+        text_norm = normalize_text(body)
+        h = compute_hash(text_norm)
+        meta = {
+            "kind": "product",
+            "name": p.name,
+            "source_type": getattr(p, "source_type", None),
+            "verified": bool(getattr(p, "verified", False)),
+            "confidence": float(getattr(p, "confidence", 0.0) or 0.0),
+        }
+        if p.price_eur is not None:
+            meta["price_eur"] = float(p.price_eur)
+        if p.price_unit:
+            meta["price_unit"] = p.price_unit
+        if p.attributes:
+            meta["attributes"] = p.attributes
+        if p.image_url:
+            meta["image_url"] = p.image_url
+        product_chunk_specs.append(
+            (text_norm, h, p.source_url or "", "products", meta)
+        )
+
+    # 2) Build prose chunks from raw page text
+    prose_chunk_specs: list[tuple[str, str, str, str, dict]] = []
+    for raw_text, src_url, section_hint in chunks_text_tuples:
+        if not raw_text or len(raw_text) < 50:
+            continue
+        try:
+            chunks = chunk_text(
+                raw_text,
+                target_size=800,
+                overlap=100,
+                min_size=100,
+                max_size=1500,
+            )
+        except Exception as e:
+            logger.warning("chunk_text failed for %s: %s", src_url, e)
+            continue
+        for ch in chunks:
+            prose_chunk_specs.append(
+                (
+                    ch.text,
+                    ch.content_hash,
+                    src_url,
+                    section_hint or "general",
+                    {"char_count": ch.char_count, "paragraph_idx": ch.paragraph_idx},
+                )
+            )
+
+    all_specs = product_chunk_specs + prose_chunk_specs
+
+    # 3) Dedupe vs DB by content_hash
+    new_specs: list[tuple[str, str, str, str, dict]] = []
+    superseded_old: list[uuid.UUID] = []
+    if all_specs:
+        async with AsyncSessionLocal() as session:
+            hashes = list({h for _, h, _, _, _ in all_specs})
+            stmt = select(BrainChunk.content_hash).where(
+                BrainChunk.company_id == company_id,
+                BrainChunk.content_hash.in_(hashes),
+                BrainChunk.superseded_at.is_(None),
+            )
+            existing = set((await session.execute(stmt)).scalars().all())
+
+            url_to_new_hashes: dict[str, set[str]] = {}
+            for _, h, src_url, _, _ in all_specs:
+                if src_url:
+                    url_to_new_hashes.setdefault(src_url, set()).add(h)
+
+            if url_to_new_hashes:
+                rows = (
+                    await session.execute(
+                        sa_text(
+                            "SELECT id, source_url, content_hash FROM brain_chunks "
+                            "WHERE company_id = :cid AND superseded_at IS NULL "
+                            "AND source_url = ANY(:urls)"
+                        ),
+                        {
+                            "cid": str(company_id),
+                            "urls": list(url_to_new_hashes.keys()),
+                        },
+                    )
+                ).all()
+                for r in rows:
+                    rid, src_url, old_hash = r[0], r[1], r[2]
+                    if (
+                        src_url in url_to_new_hashes
+                        and old_hash not in url_to_new_hashes[src_url]
+                    ):
+                        superseded_old.append(rid)
+
+        for spec in all_specs:
+            if spec[1] not in existing:
+                new_specs.append(spec)
+        result.chunks_skipped = len(all_specs) - len(new_specs)
+
+    # 4) Embed
+    if new_specs:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        try:
+            embeddings = await embed_batch([t for t, _, _, _, _ in new_specs], client)
+        finally:
+            await client.close()
+        if len(embeddings) != len(new_specs):
+            raise RuntimeError(
+                f"embedding count mismatch: {len(embeddings)} vs {len(new_specs)} chunks"
+            )
+    else:
+        embeddings = []
+
+    # 5) Insert in transaction
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            if superseded_old:
+                await session.execute(
+                    sa_text(
+                        "UPDATE brain_chunks SET superseded_at = now() "
+                        "WHERE id = ANY(:ids)"
+                    ),
+                    {"ids": [str(i) for i in superseded_old]},
+                )
+                result.chunks_superseded = len(superseded_old)
+
+            for (text, h, src_url, section, meta), emb in zip(new_specs, embeddings):
+                obj = BrainChunk(
+                    company_id=company_id,
+                    text=text,
+                    source_url=src_url or None,
+                    source_type="web",
+                    section=section,
+                    content_hash=h,
+                    embedding=emb,
+                    meta=meta,
+                )
+                session.add(obj)
+                result.chunks_inserted += 1
+                if meta.get("kind") == "product":
+                    result.products_inserted += 1
+
+            # Facts: upsert
+            for f in facts:
+                value_str = (f.value or "").strip()
+                if not value_str:
+                    continue
+                subject = _normalize_subject(f.key, value_str)
+                evidence_value = value_str[:500]
+                await session.execute(
+                    sa_text(
+                        """
+                        INSERT INTO brain_facts (company_id, key, subject, value, evidence, source_url, confidence)
+                        VALUES (:cid, :key, :subject, CAST(:value AS jsonb), :evidence, :source_url, :confidence)
+                        ON CONFLICT (company_id, key, subject) DO UPDATE
+                        SET value = EXCLUDED.value,
+                            evidence = EXCLUDED.evidence,
+                            source_url = EXCLUDED.source_url,
+                            confidence = GREATEST(brain_facts.confidence, EXCLUDED.confidence),
+                            updated_at = now()
+                        """
+                    ),
+                    {
+                        "cid": str(company_id),
+                        "key": f.key,
+                        "subject": subject,
+                        "value": _json.dumps(
+                            {"value": value_str, "source_type": f.source_type},
+                            ensure_ascii=False,
+                        ),
+                        "evidence": evidence_value,
+                        "source_url": f.source_url or None,
+                        "confidence": float(f.confidence),
+                    },
+                )
+                result.facts_inserted += 1
+
+            # FAQs: dedupe by question
+            if faqs:
+                existing_q = (
+                    await session.execute(
+                        sa_text(
+                            "SELECT question FROM brain_faqs WHERE company_id = :cid"
+                        ),
+                        {"cid": str(company_id)},
+                    )
+                ).scalars().all()
+                existing_set = {q.strip().lower() for q in existing_q}
+
+                seen_q: set[str] = set()
+                fresh_faqs: list = []
+                faq_texts: list[str] = []
+                for faq in faqs:
+                    norm_q = faq.question.strip().lower()
+                    if not norm_q or norm_q in seen_q or norm_q in existing_set:
+                        continue
+                    seen_q.add(norm_q)
+                    fresh_faqs.append(faq)
+                    faq_texts.append(f"{faq.question}\n{faq.answer}")
+
+                if fresh_faqs:
+                    client2 = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+                    try:
+                        faq_embeddings = await embed_batch(faq_texts, client2)
+                    finally:
+                        await client2.close()
+                    for faq, fe in zip(fresh_faqs, faq_embeddings):
+                        session.add(
+                            BrainFaq(
+                                company_id=company_id,
+                                question=faq.question,
+                                answer=faq.answer,
+                                source_url=faq.source_url or None,
+                                embedding=fe,
+                            )
+                        )
+                        result.faqs_inserted += 1
+
+
+async def _persist_to_extraction_runs(
+    company_id: uuid.UUID,
+    job_id: str,
+    source_url: str,
+    products: list,
+    facts: list,
+    faqs: list,
+    images: list,
+    total_cost_usd: float,
+    result: IngestResult,
+) -> str | None:
+    """Save to staging extraction_runs + per-entity tables (Phase 2/3 review UI).
+
+    Best-effort: schema may not exist in all environments yet, so individual
+    INSERTs are wrapped to avoid blowing up the entire pipeline.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                summary = {
+                    "products": len(products),
+                    "facts": len(facts),
+                    "faqs": len(faqs),
+                    "images": len(images),
+                }
+                row = (
+                    await session.execute(
+                        sa_text(
+                            """
+                            INSERT INTO extraction_runs (
+                                company_id, job_id, source_type, source_url, status,
+                                extracted_data, pages_visited, pages_succeeded,
+                                pages_failed, total_llm_cost_usd, errors
+                            )
+                            VALUES (
+                                :cid, :jid, 'web', :src, 'pending_review',
+                                CAST(:summary AS jsonb), :pv, :ps,
+                                :pf, :cost, CAST(:errors AS jsonb)
+                            )
+                            RETURNING id
+                            """
+                        ),
+                        {
+                            "cid": str(company_id),
+                            "jid": job_id,
+                            "src": source_url,
+                            "summary": _json.dumps(summary, ensure_ascii=False),
+                            "pv": result.pages_visited,
+                            "ps": result.pages_succeeded,
+                            "pf": result.pages_failed,
+                            "cost": total_cost_usd,
+                            "errors": _json.dumps(result.errors[:20], ensure_ascii=False),
+                        },
+                    )
+                ).first()
+                run_id = str(row[0]) if row else None
+
+                if run_id is None:
+                    return None
+
+                for p in products:
+                    await session.execute(
+                        sa_text(
+                            """
+                            INSERT INTO extraction_products (
+                                run_id, company_id, name, description, price_text,
+                                price_eur, price_unit, attributes, image_url,
+                                source_url, source_block_text, source_type,
+                                confidence, verified
+                            )
+                            VALUES (
+                                :rid, :cid, :name, :desc, :ptext,
+                                :peur, :punit, CAST(:attrs AS jsonb), :img,
+                                :src, :block, :stype,
+                                :conf, :ver
+                            )
+                            """
+                        ),
+                        {
+                            "rid": run_id,
+                            "cid": str(company_id),
+                            "name": p.name,
+                            "desc": p.description,
+                            "ptext": p.price_text,
+                            "peur": p.price_eur,
+                            "punit": p.price_unit,
+                            "attrs": _json.dumps(p.attributes or {}, ensure_ascii=False),
+                            "img": p.image_url,
+                            "src": p.source_url,
+                            "block": p.source_block_text,
+                            "stype": p.source_type,
+                            "conf": float(p.confidence),
+                            "ver": bool(p.verified),
+                        },
+                    )
+
+                for f in facts:
+                    await session.execute(
+                        sa_text(
+                            """
+                            INSERT INTO extraction_facts (
+                                run_id, company_id, key, value,
+                                source_url, source_type, confidence
+                            )
+                            VALUES (
+                                :rid, :cid, :key, :value,
+                                :src, :stype, :conf
+                            )
+                            """
+                        ),
+                        {
+                            "rid": run_id,
+                            "cid": str(company_id),
+                            "key": f.key,
+                            "value": f.value,
+                            "src": f.source_url,
+                            "stype": f.source_type,
+                            "conf": float(f.confidence),
+                        },
+                    )
+
+                for fq in faqs:
+                    await session.execute(
+                        sa_text(
+                            """
+                            INSERT INTO extraction_faqs (
+                                run_id, company_id, question, answer,
+                                source_url, source_type, confidence
+                            )
+                            VALUES (
+                                :rid, :cid, :q, :a,
+                                :src, :stype, :conf
+                            )
+                            """
+                        ),
+                        {
+                            "rid": run_id,
+                            "cid": str(company_id),
+                            "q": fq.question,
+                            "a": fq.answer,
+                            "src": fq.source_url,
+                            "stype": fq.source_type,
+                            "conf": float(fq.confidence),
+                        },
+                    )
+
+                for img in images:
+                    await session.execute(
+                        sa_text(
+                            """
+                            INSERT INTO extraction_images (
+                                run_id, company_id, image_url, alt_text,
+                                description, near_product_name, source_url
+                            )
+                            VALUES (
+                                :rid, :cid, :url, :alt,
+                                :desc, :near, :src
+                            )
+                            """
+                        ),
+                        {
+                            "rid": run_id,
+                            "cid": str(company_id),
+                            "url": img.url,
+                            "alt": img.alt_text,
+                            "desc": img.description,
+                            "near": img.near_product_name,
+                            "src": img.source_url,
+                        },
+                    )
+
+                result.products_inserted = len(products)
+                result.images_inserted = len(images)
+
+                return run_id
+    except Exception as e:
+        logger.exception("_persist_to_extraction_runs failed: %s", e)
+        return None
+
+
+# ───────────────────────────────────────────────────
+# Legacy text-only pipeline (production safety net)
+# ───────────────────────────────────────────────────
+
+
+async def _ingest_url_legacy(
+    company_id: uuid.UUID, url: str, job_id: str, max_pages: int = 30
+) -> IngestResult:
+    """Original text-only ingestion pipeline. Used when VISION_INGEST_ENABLED=False
+    or as a fallback when BrowserPool fails to start."""
     result = IngestResult()
     try:
         await _update_progress(job_id, 0, "running")
@@ -159,8 +905,6 @@ async def ingest_url(company_id: uuid.UUID, url: str, job_id: str, max_pages: in
                 rows = (await session.execute(stmt)).scalars().all()
                 existing_hashes = set(rows)
 
-            # Per-source-url supersession: if a URL was previously ingested with chunks
-            # whose content_hash is no longer present, mark them superseded.
             url_to_new_hashes: dict[str, set[str]] = {}
             for ch, page, _ in all_chunks:
                 url_to_new_hashes.setdefault(page.url, set()).add(ch.content_hash)
@@ -219,7 +963,6 @@ async def ingest_url(company_id: uuid.UUID, url: str, job_id: str, max_pages: in
         # 5. Insert in transaction
         async with AsyncSessionLocal() as session:
             async with session.begin():
-                # Mark superseded
                 if superseded_old:
                     await session.execute(
                         sa_text(
@@ -230,7 +973,6 @@ async def ingest_url(company_id: uuid.UUID, url: str, job_id: str, max_pages: in
                     )
                     result.chunks_superseded = len(superseded_old)
 
-                # Insert chunks
                 for (ch, page, section), emb in zip(new_chunks, embeddings):
                     obj = BrainChunk(
                         company_id=company_id,
@@ -245,7 +987,6 @@ async def ingest_url(company_id: uuid.UUID, url: str, job_id: str, max_pages: in
                     session.add(obj)
                     result.chunks_inserted += 1
 
-                # Insert facts (upsert on (company_id, key, subject))
                 for f in all_facts:
                     await session.execute(
                         sa_text(
@@ -264,7 +1005,7 @@ async def ingest_url(company_id: uuid.UUID, url: str, job_id: str, max_pages: in
                             "cid": str(company_id),
                             "key": f.key,
                             "subject": f.subject,
-                            "value": __import__("json").dumps(f.value, ensure_ascii=False),
+                            "value": _json.dumps(f.value, ensure_ascii=False),
                             "evidence": f.evidence,
                             "source_url": f.source_url,
                             "confidence": f.confidence,
@@ -272,10 +1013,8 @@ async def ingest_url(company_id: uuid.UUID, url: str, job_id: str, max_pages: in
                     )
                     result.facts_inserted += 1
 
-                # Insert FAQs (no unique constraint — dedupe by (company_id, question))
                 if all_faqs:
                     seen_q: set[tuple[str, str]] = set()
-                    # Pre-load existing question text for this company to skip dupes
                     existing_q = (
                         await session.execute(
                             sa_text(
@@ -286,7 +1025,6 @@ async def ingest_url(company_id: uuid.UUID, url: str, job_id: str, max_pages: in
                     ).scalars().all()
                     existing_set = {q.strip().lower() for q in existing_q}
 
-                    # Embed FAQ questions in one batch
                     faq_texts: list[str] = []
                     fresh_faqs: list[ExtractedFaq] = []
                     for faq in all_faqs:
@@ -316,7 +1054,6 @@ async def ingest_url(company_id: uuid.UUID, url: str, job_id: str, max_pages: in
                                 )
                             )
                             result.faqs_inserted += 1
-            # commit happens on session.begin() exit
 
         await _update_progress(job_id, 95)
 
