@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from typing import Any
 
@@ -89,3 +90,92 @@ async def call_sonnet(
     if tool_choice is not None:
         kwargs["tool_choice"] = tool_choice
     return await _call_with_retry(**kwargs)
+
+
+async def call_sonnet_vision(
+    system: str,
+    user_text: str,
+    image_bytes: bytes | None = None,
+    image_media_type: str = "image/png",
+    *,
+    max_tokens: int = 2000,
+    temperature: float = 0.0,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: dict[str, Any] | None = None,
+    use_cache: bool = True,
+    timeout_s: float = 90.0,
+) -> Any:
+    """Vision-capable Sonnet call s dlhsim timeoutom a optional prompt cachingom."""
+    content_blocks: list[dict[str, Any]] = []
+    if image_bytes is not None:
+        content_blocks.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image_media_type,
+                    "data": base64.standard_b64encode(image_bytes).decode("ascii"),
+                },
+            }
+        )
+    content_blocks.append({"type": "text", "text": user_text})
+
+    messages: list[dict[str, Any]] = [{"role": "user", "content": content_blocks}]
+
+    if use_cache:
+        system_param: Any = [
+            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+        ]
+    else:
+        system_param = system
+
+    cached_tools: list[dict[str, Any]] | None = None
+    if use_cache and tools is not None and len(tools) >= 1:
+        cached_tools = list(tools[:-1]) + [
+            {**tools[-1], "cache_control": {"type": "ephemeral"}}
+        ]
+    elif tools is not None:
+        cached_tools = list(tools)
+
+    kwargs: dict[str, Any] = {
+        "model": SONNET_MODEL,
+        "system": system_param,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if cached_tools is not None:
+        kwargs["tools"] = cached_tools
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
+
+    # Dedicated klient s dlhsim timeoutom - vision je pomalsi nez text-only
+    vision_client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=timeout_s)
+
+    delay = 1.0
+    last_exc: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await vision_client.messages.create(**kwargs)
+        except RateLimitError as exc:
+            last_exc = exc
+            logger.warning(
+                "anthropic vision: rate limit attempt %s/%s: %s",
+                attempt + 1,
+                MAX_RETRIES,
+                exc,
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+        except APIError as exc:
+            last_exc = exc
+            logger.warning(
+                "anthropic vision: API error attempt %s/%s: %s",
+                attempt + 1,
+                MAX_RETRIES,
+                exc,
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+    assert last_exc is not None
+    raise last_exc

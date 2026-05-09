@@ -59,5 +59,19 @@ class Settings(BaseSettings):
         """Priority: env REDIS_URL > self.REDIS_URL."""
         return os.environ.get("REDIS_URL") or self.REDIS_URL
 
+    # Knowledge Review feature flag (Phase 2/3, default vypnuty)
+    KNOWLEDGE_REVIEW_ENABLED: bool = False
+
+    # Vision-based ingest pipeline (Phase 1B/1C will use these)
+    VISION_INGEST_ENABLED: bool = True
+    VISION_MAX_PAGES_WITH_SCREENSHOT: int = 30
+    VISION_MAX_IMAGES_PER_PAGE: int = 8
+    INGEST_LLM_COST_CAP_USD: float = 1.0
+
+    # Playwright
+    PLAYWRIGHT_TIMEOUT_MS: int = 30000
+    PLAYWRIGHT_VIEWPORT_WIDTH: int = 1280
+    PLAYWRIGHT_VIEWPORT_HEIGHT: int = 800
+
 
 settings = Settings()

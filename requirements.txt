@@ -17,3 +17,5 @@ arq==0.26.1
 python-dotenv==1.0.1
 alembic==1.14.0
 pgvector==0.3.6
+playwright==1.48.0
+pillow==10.4.0
