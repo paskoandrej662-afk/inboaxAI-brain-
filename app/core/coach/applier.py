@@ -106,7 +106,7 @@ async def _apply_remove_persona_rule(
         sa_text(
             """
             UPDATE brain_persona
-            SET rules = rules - :idx,
+            SET rules = rules - CAST(:idx AS integer),
                 version = version + 1,
                 updated_at = now()
             WHERE company_id = :cid
