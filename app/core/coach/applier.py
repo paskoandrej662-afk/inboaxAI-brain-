@@ -88,7 +88,7 @@ async def _apply_add_persona_rule(
         sa_text(
             """
             UPDATE brain_persona
-            SET rules = rules || to_jsonb(:rule::text),
+            SET rules = rules || to_jsonb(:rule),
                 version = version + 1,
                 updated_at = now()
             WHERE company_id = :cid
@@ -123,7 +123,7 @@ async def _apply_add_negative_fact(
         sa_text(
             """
             UPDATE brain_persona
-            SET negative_facts = negative_facts || to_jsonb(:fact::text),
+            SET negative_facts = negative_facts || to_jsonb(:fact),
                 version = version + 1,
                 updated_at = now()
             WHERE company_id = :cid
