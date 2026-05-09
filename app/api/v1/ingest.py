@@ -8,7 +8,6 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.db import get_db
 
 router = APIRouter(prefix="/v1", tags=["ingest"])
@@ -53,12 +52,6 @@ async def trigger_ingest(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> IngestResponse:
-    if settings.ENVIRONMENT == "production":
-        raise HTTPException(
-            status_code=503,
-            detail="Ingest worker not deployed (Task 7). Use Codespace dev env for ingestion.",
-        )
-
     try:
         cid = uuid.UUID(company_id)
     except ValueError:
