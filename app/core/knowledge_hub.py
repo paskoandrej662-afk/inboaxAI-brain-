@@ -7,7 +7,8 @@ import traceback
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from openai import AsyncOpenAI
 from sqlalchemy import bindparam, select, text as sa_text
@@ -24,7 +25,15 @@ from app.core.extractor import (
     extract_faqs,
     extract_text,
 )
-from app.core.scraper import ScrapedPage, scrape_site
+from app.core.extractors.classifier import heuristic_classify
+from app.core.scraper import (
+    ScrapedPage,
+    discover_pages as legacy_discover_pages,
+    scrape_site,
+)
+
+if TYPE_CHECKING:
+    from app.core.browser import BrowserPool
 from app.db import AsyncSessionLocal
 from app.models.brain_chunks import BrainChunk
 from app.models.brain_facts import BrainFact
@@ -131,6 +140,142 @@ async def ingest_url(
 
 
 # ───────────────────────────────────────────────────
+# Hybrid page discovery (legacy + JS-rendered)
+# ───────────────────────────────────────────────────
+
+
+def _prioritize_urls(
+    urls: list[str], start_domain: str, max_pages: int
+) -> list[str]:
+    """Same-domain filter + priority sort by URL heuristics + max_pages cap.
+
+    - score = heuristic_classify(url):
+        - other_low_value (legal/cookies/gdpr) → 0.0
+        - known type → base score (home=0.85, faq=0.95, ...)
+        - None (unknown) → 0.5
+    - Same-domain only (with www. normalization).
+    - Dedupe case-insensitive po normalizácii (lower netloc, bez fragmentu, bez trailing /).
+    - Sort desc by score, tie-break alphabetically; vrátime prvých max_pages.
+    """
+    if not urls:
+        return []
+
+    seen: set[str] = set()
+    candidates: list[tuple[float, str]] = []
+
+    for u in urls:
+        if not u or not isinstance(u, str):
+            continue
+
+        try:
+            parsed = urlparse(u)
+        except Exception:
+            continue
+
+        if parsed.netloc and parsed.netloc != start_domain:
+            if parsed.netloc.lstrip("www.") != start_domain.lstrip("www."):
+                continue
+
+        if parsed.scheme and parsed.scheme not in ("http", "https"):
+            continue
+
+        normalized = (
+            (parsed.scheme or "https")
+            + "://"
+            + (parsed.netloc or start_domain).lower()
+            + (parsed.path.rstrip("/") or "/")
+        )
+        if parsed.query:
+            normalized += "?" + parsed.query
+
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        h = heuristic_classify(normalized)
+        if h is None:
+            score = 0.5
+        else:
+            page_type, base_score = h
+            score = 0.0 if page_type == "other_low_value" else base_score
+
+        candidates.append((score, normalized))
+
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return [url for _, url in candidates[:max_pages]]
+
+
+async def _discover_pages_hybrid(
+    start_url: str,
+    browser: "BrowserPool",
+    max_pages: int,
+) -> list[str]:
+    """Hybrid page discovery: legacy (requests+BS4) + JS-rendered (Playwright).
+
+    1. legacy_discover_pages — lacný baseline, JS-rendered linky nevidí.
+    2. browser.discover_links(start_url) — JS DOM, doplní dynamické linky.
+    3. Pre top-3 listing/pricing stránky urobí 1-hop browser.discover_links() pre detail linky.
+    4. Union → priorita → cap na max_pages.
+
+    Defenzívne: žiadny error neraisuje, vždy vráti aspoň [start_url].
+    """
+    try:
+        start_domain = urlparse(start_url).netloc.lower()
+    except Exception:
+        start_domain = ""
+
+    all_urls: list[str] = [start_url]
+
+    # Step 1: Legacy discovery (cheap baseline; over-fetch — prioritize later)
+    try:
+        legacy = await legacy_discover_pages(start_url, max_pages=max_pages * 3)
+        if legacy:
+            all_urls.extend(legacy)
+            logger.info("hybrid discovery legacy: +%d urls", len(legacy))
+    except Exception as e:
+        logger.warning("legacy discovery failed: %s", e)
+
+    # Step 2: Browser-rendered discovery on start URL
+    try:
+        js_links = await browser.discover_links(start_url)
+        if js_links:
+            all_urls.extend(js_links)
+            logger.info("hybrid discovery browser(start): +%d urls", len(js_links))
+    except Exception as e:
+        logger.warning("browser discover_links(start) failed: %s", e)
+
+    # Step 3: 1-hop discovery from top listing/pricing pages
+    prioritized_so_far = _prioritize_urls(all_urls, start_domain, max_pages * 3)
+    listing_urls: list[str] = []
+    for u in prioritized_so_far[:10]:
+        h = heuristic_classify(u)
+        if h is not None and h[0] in {"product_listing", "service_pricing"}:
+            listing_urls.append(u)
+        if len(listing_urls) >= 3:
+            break
+
+    for listing_url in listing_urls:
+        try:
+            sub_links = await browser.discover_links(listing_url)
+            if sub_links:
+                all_urls.extend(sub_links)
+                logger.info(
+                    "hybrid discovery browser(%s): +%d urls",
+                    listing_url,
+                    len(sub_links),
+                )
+        except Exception as e:
+            logger.warning("browser discover_links(%s) failed: %s", listing_url, e)
+
+    final = _prioritize_urls(all_urls, start_domain, max_pages)
+    logger.info(
+        "hybrid discovery final: %d urls (start_domain=%s)", len(final), start_domain
+    )
+    return final
+
+
+# ───────────────────────────────────────────────────
 # New vision-based pipeline (Phase 1C)
 # ───────────────────────────────────────────────────
 
@@ -157,24 +302,13 @@ async def _ingest_url_vision(
     )
     from app.core.extractors.verification import verify_fact, verify_product
     from app.core.extractors.vision import extract_page_with_vision
-    from app.core.scraper import discover_pages as legacy_discover_pages
 
     result = IngestResult()
 
     try:
         await _update_progress(job_id, 0, "running")
 
-        # 1. Discover pages
-        try:
-            pages = await legacy_discover_pages(url, max_pages=max_pages)
-        except Exception as e:
-            logger.warning("discover_pages failed: %s — using only start URL", e)
-            pages = [url]
-        pages = pages[:max_pages]
-        total = len(pages) or 1
-        logger.info("ingest_url: discovered %d pages for %s", len(pages), url)
-
-        # 2. Init browser
+        # 1. Init browser FIRST (discovery teraz potrebuje browser pre JS-rendered linky)
         browser = BrowserPool()
         try:
             await browser.start()
@@ -183,6 +317,21 @@ async def _ingest_url_vision(
                 "BrowserPool start failed: %s — falling back to legacy ingest", e
             )
             return await _ingest_url_legacy(company_id, url, job_id, max_pages)
+
+        # 2. Hybrid discovery (legacy + JS-rendered)
+        try:
+            pages = await _discover_pages_hybrid(url, browser, max_pages)
+        except Exception as e:
+            logger.warning(
+                "hybrid discover_pages failed: %s — using only start URL", e
+            )
+            pages = [url]
+
+        if not pages:
+            pages = [url]
+
+        total = len(pages)
+        logger.info("ingest_url: discovered %d pages for %s (hybrid)", total, url)
 
         all_products: list = []
         all_facts: list = []
