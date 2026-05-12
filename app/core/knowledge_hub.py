@@ -301,7 +301,10 @@ async def _ingest_url_vision(
         merge_products,
     )
     from app.core.extractors.verification import verify_fact, verify_product
-    from app.core.extractors.vision import extract_page_with_vision
+    from app.core.extractors.vision import (
+        extract_page_with_tiled_vision,
+        extract_page_with_vision,
+    )
 
     result = IngestResult()
 
@@ -345,17 +348,23 @@ async def _ingest_url_vision(
                 try:
                     await _update_progress(job_id, int((i / total) * 90))
 
-                    rendered = await browser.render_page(
-                        page_url, take_screenshot=True
+                    # 1. Render page (lightweight najprv — precitame HTML + rozhodneme tile vs single)
+                    rendered_basic = await browser.render_page(
+                        page_url, take_screenshot=False
                     )
-                    if rendered.error:
-                        result.errors.append(f"render {page_url}: {rendered.error}")
+                    if rendered_basic.error:
+                        result.errors.append(
+                            f"render {page_url}: {rendered_basic.error}"
+                        )
                         result.pages_failed += 1
                         continue
                     result.pages_visited += 1
 
+                    # 2. Raw text + klasifikacia
                     try:
-                        content = extract_text(rendered.html, rendered.final_url)
+                        content = extract_text(
+                            rendered_basic.html, rendered_basic.final_url
+                        )
                         raw_text = content.text or ""
                         title = content.title or ""
                         section_hint = content.section
@@ -378,21 +387,26 @@ async def _ingest_url_vision(
                         logger.info("skipping low-value page: %s", page_url)
                         continue
 
+                    # 3. HTML structured extraction (lacne, deterministicke)
                     html_products = extract_jsonld_products(
-                        rendered.html, rendered.final_url
+                        rendered_basic.html, rendered_basic.final_url
                     )
-                    html_faqs = extract_jsonld_faq(rendered.html, rendered.final_url)
+                    html_faqs = extract_jsonld_faq(
+                        rendered_basic.html, rendered_basic.final_url
+                    )
                     html_business = extract_jsonld_business(
-                        rendered.html, rendered.final_url
+                        rendered_basic.html, rendered_basic.final_url
                     )
                     html_business += extract_contact_patterns(
-                        raw_text, rendered.final_url
+                        raw_text, rendered_basic.final_url
                     )
-                    html_images = extract_image_refs(rendered.html, rendered.final_url)
+                    html_images = extract_image_refs(
+                        rendered_basic.html, rendered_basic.final_url
+                    )
 
+                    # 4. Vision extraction — TILED pre vision-worthy stranky
                     use_vision = (
-                        rendered.screenshot_png is not None
-                        and page_type
+                        page_type
                         in {
                             "product_listing",
                             "product_detail",
@@ -412,18 +426,54 @@ async def _ingest_url_vision(
                     summary = ""
                     cost = 0.0
                     if use_vision:
-                        (
-                            vp,
-                            vf,
-                            vfq,
-                            vi,
-                            summary,
-                            cost,
-                        ) = await extract_page_with_vision(
-                            rendered, page_type, raw_text
-                        )
+                        try:
+                            # NEW: tiled rendering + tiled vision
+                            tiled = await browser.render_page_tiled(page_url)
+                            if tiled.segments:
+                                logger.info(
+                                    "using tiled vision for %s (scrollHeight=%d, %d segments)",
+                                    page_url,
+                                    tiled.scroll_height,
+                                    len(tiled.segments),
+                                )
+                                (
+                                    vp,
+                                    vf,
+                                    vfq,
+                                    vi,
+                                    summary,
+                                    cost,
+                                ) = await extract_page_with_tiled_vision(
+                                    tiled, page_type, raw_text
+                                )
+                            else:
+                                # Fallback na legacy single screenshot
+                                logger.warning(
+                                    "tiled returned 0 segments for %s, fallback to single",
+                                    page_url,
+                                )
+                                rendered_single = await browser.render_page(
+                                    page_url, take_screenshot=True
+                                )
+                                if rendered_single.screenshot_png:
+                                    (
+                                        vp,
+                                        vf,
+                                        vfq,
+                                        vi,
+                                        summary,
+                                        cost,
+                                    ) = await extract_page_with_vision(
+                                        rendered_single, page_type, raw_text
+                                    )
+                        except Exception as e:
+                            logger.warning(
+                                "vision extraction failed for %s: %s", page_url, e
+                            )
+
                         total_cost_usd += cost
 
+                        # Verify vision-extracted fakty (anti-halucinacia, reuse existing)
                         vp = [verify_product(p, raw_text) for p in vp]
                         verified_facts = []
                         for f in vf:
@@ -432,6 +482,7 @@ async def _ingest_url_vision(
                                 verified_facts.append(vf2)
                         vf = verified_facts
 
+                    # 5. Merge per-page (JSON-LD + vision)
                     page_products = merge_products(html_products, vp)
                     page_facts = merge_facts(html_business, vf)
                     page_faqs = merge_faqs(html_faqs, vfq)
@@ -443,7 +494,7 @@ async def _ingest_url_vision(
 
                     if raw_text:
                         all_chunks_text_tuples.append(
-                            (raw_text, rendered.final_url, section_hint)
+                            (raw_text, rendered_basic.final_url, section_hint)
                         )
 
                     result.pages_succeeded += 1

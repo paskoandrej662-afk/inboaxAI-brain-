@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
-from app.core.browser import RenderedPage
+from app.core.browser import RenderedPage, TiledPageResult
+from app.core.extractors.merger import (
+    merge_facts,
+    merge_faqs,
+    merge_images,
+    merge_products,
+)
 from app.core.extractors.types import (
     ExtractedBusinessFact,
     ExtractedFaqItem,
@@ -350,3 +357,213 @@ async def describe_image(
             parts.append(block.text)
     description = "".join(parts).strip()
     return description if description else None
+
+
+# ───────────────────────────────────────────────────
+# Tiled vision — multi-viewport screenshot extraction (Phase 2B-1)
+# ───────────────────────────────────────────────────
+
+
+async def _extract_one_tile(
+    tile_bytes: bytes,
+    tile_index: int,
+    total_tiles: int,
+    page_url: str,
+    page_type: str,
+    raw_text_excerpt: str,
+) -> tuple[list, list, list, list, str, float]:
+    """Extrahuj strukturovane data z jedneho tile screenshotu.
+
+    Returns: (products, facts, faqs, images, summary, cost_usd).
+    Pouziva prompt caching pre system + tool schema (saves ~60% na opakovanych volaniach).
+    """
+    user_text = (
+        f"URL: {page_url}\n"
+        f"Typ stranky: {page_type}\n"
+        f"Toto je segment {tile_index + 1} z {total_tiles} (skrolovany screenshot 1280x2200 px).\n"
+        f"Mozes vidiet len cast stranky — sustred sa na produkty/sluzby/fakty viditelne v tomto segmente.\n\n"
+        f"HTML extracted text (kontext z celej stranky):\n{raw_text_excerpt[:2500]}"
+    )
+
+    try:
+        response = await call_sonnet_vision(
+            system=VISION_SYSTEM,
+            user_text=user_text,
+            image_bytes=tile_bytes,
+            tools=[VISION_TOOL_SCHEMA],
+            tool_choice={"type": "tool", "name": "extract_page_data"},
+            max_tokens=2500,
+            use_cache=True,  # CRITICAL — prompt caching na system + tools
+            timeout_s=90.0,
+        )
+    except Exception as e:
+        logger.warning("tile %d vision call failed: %s", tile_index, e)
+        return [], [], [], [], "", 0.0
+
+    # Najdi tool_use block
+    tool_use = None
+    for block in response.content:
+        if getattr(block, "type", None) == "tool_use":
+            tool_use = block
+            break
+    if tool_use is None:
+        return [], [], [], [], "", 0.0
+
+    data = tool_use.input or {}
+
+    # Parse products
+    products: list = []
+    for p in (data.get("products") or []):
+        if not isinstance(p, dict) or not p.get("name"):
+            continue
+        try:
+            price_eur = float(p["price_eur"]) if p.get("price_eur") is not None else None
+        except (TypeError, ValueError):
+            price_eur = None
+        products.append(ExtractedProduct(
+            name=str(p["name"]).strip(),
+            description=str(p["description"]).strip() if p.get("description") else None,
+            price_text=str(p["price_text"]).strip() if p.get("price_text") else None,
+            price_eur=price_eur,
+            price_unit=str(p["price_unit"]) if p.get("price_unit") else None,
+            attributes={k: str(v) for k, v in (p.get("attributes") or {}).items() if v is not None},
+            image_url=str(p["image_url"]) if p.get("image_url") else None,
+            source_url=page_url,
+            source_block_text=raw_text_excerpt[:500],
+            source_type="vision",
+            confidence=0.7,
+            verified=False,
+        ))
+
+    # Parse facts
+    facts: list = []
+    for f in (data.get("business_facts") or []):
+        if not isinstance(f, dict) or not f.get("key") or not f.get("value"):
+            continue
+        facts.append(ExtractedBusinessFact(
+            key=str(f["key"]),
+            value=str(f["value"]).strip(),
+            source_url=page_url,
+            source_type="vision",
+            confidence=0.7,
+        ))
+
+    # Parse faqs
+    faqs: list = []
+    for fq in (data.get("faqs") or []):
+        if not isinstance(fq, dict) or not fq.get("question") or not fq.get("answer"):
+            continue
+        faqs.append(ExtractedFaqItem(
+            question=str(fq["question"]).strip(),
+            answer=str(fq["answer"]).strip(),
+            source_url=page_url,
+            source_type="vision",
+            confidence=0.7,
+        ))
+
+    # Parse images
+    images: list = []
+    for img in (data.get("image_descriptions") or []):
+        if not isinstance(img, dict) or not img.get("image_url"):
+            continue
+        images.append(ExtractedImage(
+            url=str(img["image_url"]),
+            description=str(img["description"]) if img.get("description") else None,
+            near_product_name=str(img["near_product_name"]) if img.get("near_product_name") else None,
+            source_url=page_url,
+        ))
+
+    summary = str(data.get("page_summary") or "")
+
+    # Vypocet ceny
+    cost = 0.0
+    try:
+        usage = response.usage
+        input_tokens = getattr(usage, "input_tokens", 0) or 0
+        output_tokens = getattr(usage, "output_tokens", 0) or 0
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        regular_input = max(0, input_tokens - cache_read)
+        # Sonnet pricing: $3/M input, $15/M output, $0.30/M cache-read, $3.75/M cache-write
+        cost = (
+            (regular_input + cache_write * 1.25) * 3.0 / 1_000_000
+            + cache_read * 0.3 / 1_000_000
+            + output_tokens * 15.0 / 1_000_000
+        )
+    except Exception:
+        cost = 0.0
+
+    return products, facts, faqs, images, summary, cost
+
+
+async def extract_page_with_tiled_vision(
+    tiled: TiledPageResult,
+    page_type: str,
+    raw_text: str,
+) -> tuple[list, list, list, list, str, float]:
+    """Extrahuj strukturovane data z multi-tile renderovanej stranky.
+
+    Vola Sonnet vision na kazdy tile PARALELNE s prompt cachingom.
+    Zlucuje products/facts/faqs/images cez tiles pomocou existujuceho mergera (dedupe by name).
+
+    Pre single-tile (kratka stranka) result: funguje identicky ako extract_page_with_vision,
+    len pouziva novy pipeline.
+
+    Returns: (merged_products, merged_facts, merged_faqs, merged_images, combined_summary, total_cost_usd).
+    """
+    if not tiled.segments:
+        logger.info("tiled vision: no segments for %s, returning empty", tiled.url)
+        return [], [], [], [], "", 0.0
+
+    num_tiles = len(tiled.segments)
+    logger.info("tiled vision extracting %s: %d tiles", tiled.url, num_tiles)
+
+    # Paralelna extrakcia s concurrency limitom (vyhneme sa rate limitom)
+    semaphore = asyncio.Semaphore(3)
+
+    async def _extract_with_sem(idx, tile_bytes):
+        async with semaphore:
+            return await _extract_one_tile(
+                tile_bytes, idx, num_tiles,
+                tiled.final_url, page_type, raw_text,
+            )
+
+    tasks = [_extract_with_sem(i, seg) for i, seg in enumerate(tiled.segments)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Pozbieraj vysledky, preskoc exceptions
+    all_products: list = []
+    all_facts: list = []
+    all_faqs: list = []
+    all_images: list = []
+    summaries: list[str] = []
+    total_cost = 0.0
+
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            logger.warning("tile %d raised: %s", i, r)
+            continue
+        products, facts, faqs, images, summary, cost = r
+        all_products.extend(products)
+        all_facts.extend(facts)
+        all_faqs.extend(faqs)
+        all_images.extend(images)
+        if summary:
+            summaries.append(summary)
+        total_cost += cost
+
+    # Zluc cez tiles pomocou existujuceho mergera (dedupe by normalized name)
+    merged_products = merge_products(all_products)
+    merged_facts = merge_facts(all_facts)
+    merged_faqs = merge_faqs(all_faqs)
+    merged_images = merge_images(all_images)
+
+    combined_summary = " ".join(summaries[:3]) if summaries else ""
+
+    logger.info(
+        "tiled vision done %s: %d tiles -> products=%d facts=%d faqs=%d images=%d cost=$%.4f",
+        tiled.url, num_tiles, len(merged_products), len(merged_facts),
+        len(merged_faqs), len(merged_images), total_cost,
+    )
+
+    return merged_products, merged_facts, merged_faqs, merged_images, combined_summary, total_cost
