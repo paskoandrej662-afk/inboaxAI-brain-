@@ -1,1 +1,1 @@
-done: vsetky verifikacie passed
+2A-2: DONE ✅ — raw_extraction.py + 3 sady testov hotove. Tests: 100 passed (64 baseline + 36 nove). renderer.py/crawler.py nezmenene, Phase 1 + 2A-1 nedotknute. Git: bez commitu (na zelanie). Dalej: Phase 2B (block detector + klasifikator).
