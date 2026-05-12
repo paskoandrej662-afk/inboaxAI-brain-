@@ -50,6 +50,9 @@ class DetectedBlock:
     depth: int
     parent_selector: str | None
     confidence: float
+    # Extra hint text z rodicovskeho kontextu (az 3 urovne vyssie) — vyplnene len ked
+    # je vlastny text bloku prilis kratky (napr. samostatny .price span).
+    nearby_card_text: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +228,28 @@ def _links_of(el: Tag, limit: int) -> list[dict]:
     ]
 
 
+def _nearby_text(el: Tag, max_levels: int = 3) -> str | None:
+    """Text z najblizsieho rodica (az `max_levels` vyssie), ktory ma rozumnu dlzku.
+
+    Pouzite ako "hint" pri malych blokoch (napr. samostatny .price span), aby Phase 2B
+    mal sancu spojit cenu s nazvom karty.
+    """
+    levels = 0
+    for parent in el.parents:
+        if levels >= max_levels:
+            break
+        if not isinstance(parent, Tag) or parent.name == "[document]":
+            break
+        levels += 1
+        try:
+            txt = parent.get_text(separator=" ", strip=True)
+        except Exception:
+            continue
+        if 60 <= len(txt) <= 4000:
+            return txt[:2000]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Hlavny vstup
 # ---------------------------------------------------------------------------
@@ -235,6 +260,7 @@ def detect_blocks(html: str, max_blocks: int = 200) -> list[DetectedBlock]:
     (ciastocny) zoznam.
     """
     out: list[DetectedBlock] = []
+    seen_selectors: set[str] = set()
     try:
         soup = BeautifulSoup(html or "", "html.parser")
         position_index = 0
@@ -247,6 +273,10 @@ def detect_blocks(html: str, max_blocks: int = 200) -> list[DetectedBlock]:
                 text = el.get_text(separator=" ", strip=True)
                 if len(text) < _MIN_TEXT_SEMANTIC:
                     continue
+                sel = _build_selector(el)
+                if sel in seen_selectors:
+                    continue
+                seen_selectors.add(sel)
                 signals = _build_signals(el, text)
                 signals.section_heading = _section_heading_for(el)
                 hint = _classify_block_hint(el, signals, 0)
@@ -254,7 +284,7 @@ def detect_blocks(html: str, max_blocks: int = 200) -> list[DetectedBlock]:
                 parent = el.parent
                 out.append(DetectedBlock(
                     block_type_hint=hint,
-                    selector=_build_selector(el),
+                    selector=sel,
                     section_heading=signals.section_heading,
                     text=text[:5000],
                     html_snippet=str(el)[:2000],
@@ -270,6 +300,7 @@ def detect_blocks(html: str, max_blocks: int = 200) -> list[DetectedBlock]:
                         else None
                     ),
                     confidence=0.60,
+                    nearby_card_text=_nearby_text(el) if len(text) < 50 else None,
                 ))
                 position_index += 1
 
@@ -296,27 +327,51 @@ def detect_blocks(html: str, max_blocks: int = 200) -> list[DetectedBlock]:
                     text = child.get_text(separator=" ", strip=True)
                     if len(text) < _MIN_TEXT_REPEATED:
                         continue
-                    signals = _build_signals(child, text)
+
+                    # Ak je child prilis maly a vyzera ako sub-element (napr. samostatny
+                    # .price span), pouzi jeho "stareho rodica" (parent.parent) ako skutocnu
+                    # kartu — ak ten ma signaly produktu (obrazok / link) a podstatne viac textu.
+                    effective_el = child
+                    if (
+                        len(text) < 50
+                        and not child.find("img")
+                        and isinstance(child.parent, Tag)
+                        and isinstance(getattr(child.parent, "parent", None), Tag)
+                        and child.parent.parent.name != "[document]"
+                    ):
+                        gp = child.parent.parent
+                        gp_text = gp.get_text(separator=" ", strip=True)
+                        if len(gp_text) > 100 and (gp.find("img") or gp.find("a", href=True)):
+                            effective_el = gp
+                            text = gp_text  # pouzi vacsi text karty
+
+                    sel = _build_selector(effective_el)
+                    if sel in seen_selectors:
+                        continue
+                    seen_selectors.add(sel)
+
+                    signals = _build_signals(effective_el, text)
                     signals.repeated_structure_count = len(siblings)
-                    signals.section_heading = _section_heading_for(child)
-                    hint = _classify_block_hint(child, signals, len(siblings))
+                    signals.section_heading = _section_heading_for(effective_el)
+                    hint = _classify_block_hint(effective_el, signals, len(siblings))
                     if hint == BlockTypeHint.UNKNOWN.value:
                         continue  # preskoc sum
 
                     out.append(DetectedBlock(
                         block_type_hint=hint,
-                        selector=_build_selector(child),
+                        selector=sel,
                         section_heading=signals.section_heading,
                         text=text[:5000],
-                        html_snippet=str(child)[:2000],
-                        headings=_headings_of(child, 5),
-                        images=_images_of(child, 10),
-                        links=_links_of(child, 20),
+                        html_snippet=str(effective_el)[:2000],
+                        headings=_headings_of(effective_el, 5),
+                        images=_images_of(effective_el, 10),
+                        links=_links_of(effective_el, 20),
                         signals=signals,
                         position_index=position_index,
-                        depth=len(list(child.parents)),
+                        depth=len(list(effective_el.parents)),
                         parent_selector=_build_selector(parent),
                         confidence=0.70,  # vyssia istota pri opakovanej strukture
+                        nearby_card_text=_nearby_text(child) if len(text) < 50 else None,
                     ))
                     position_index += 1
 
@@ -329,11 +384,15 @@ def detect_blocks(html: str, max_blocks: int = 200) -> list[DetectedBlock]:
             text = det.get_text(separator=" ", strip=True)
             if not q or not text:
                 continue
+            sel = _build_selector(det)
+            if sel in seen_selectors:
+                continue
+            seen_selectors.add(sel)
             signals = _build_signals(det, text)
             signals.has_question = True
             out.append(DetectedBlock(
                 block_type_hint=BlockTypeHint.FAQ_CANDIDATE.value,
-                selector=_build_selector(det),
+                selector=sel,
                 section_heading=None,
                 text=text[:5000],
                 html_snippet=str(det)[:2000],

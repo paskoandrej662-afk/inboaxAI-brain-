@@ -71,3 +71,16 @@ def test_priority_skips_binary_extensions():
     c = _crawler()
     assert c._priority_for_url('https://x.sk/foo.pdf') < 0.2
     assert c._priority_for_url('https://x.sk/img.jpg') < 0.2
+
+
+def test_priority_jpg_is_zero():
+    crawler = CrawlerV2(renderer=None, max_pages=10)
+    assert crawler._priority_for_url('https://x.sk/wp-content/uploads/photo.jpg') < 0.05
+    assert crawler._priority_for_url('https://x.sk/img.PNG') < 0.05
+    assert crawler._priority_for_url('https://x.sk/file.pdf') < 0.05
+
+
+def test_priority_static_assets_zero():
+    crawler = CrawlerV2(renderer=None, max_pages=10)
+    assert crawler._priority_for_url('https://x.sk/style.css') < 0.05
+    assert crawler._priority_for_url('https://x.sk/main.js') < 0.05

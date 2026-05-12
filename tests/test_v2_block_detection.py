@@ -47,3 +47,28 @@ def test_detect_signals_price():
     blocks = detect_blocks(html)
     found = [b for b in blocks if b.signals.has_price]
     assert len(found) >= 1
+
+
+def test_detect_repeated_card_uses_parent_when_small_child():
+    """When inner siblings are tiny (e.g. price spans), engine should treat the
+    grandparent as the card and include its full text (name + price)."""
+    html = """
+    <div class="grid">
+      <div class="card"><img src="/p1.jpg"><h3>Skakaci Hrad Tiger</h3><span class="price">160 €</span></div>
+      <div class="card"><img src="/p2.jpg"><h3>Skakaci Hrad Indian</h3><span class="price">160 €</span></div>
+      <div class="card"><img src="/p3.jpg"><h3>Skakaci Hrad Pirat</h3><span class="price">150 €</span></div>
+    </div>
+    """
+    from app.core.ingest_v2.block_detection import detect_blocks
+    blocks = detect_blocks(html)
+    cards_with_name = [b for b in blocks if "Tiger" in b.text or "Indian" in b.text or "Pirat" in b.text]
+    assert len(cards_with_name) >= 1, f"Expected card with name in text, got: {[b.text[:50] for b in blocks]}"
+
+
+def test_detect_no_duplicate_selectors():
+    """Same element should not appear twice in the output."""
+    html = "<section><h2>O nas</h2><p>Tu je dlhsi text o nasej firme z roku 2020.</p></section>"
+    from app.core.ingest_v2.block_detection import detect_blocks
+    blocks = detect_blocks(html)
+    selectors = [b.selector for b in blocks]
+    assert len(selectors) == len(set(selectors)), f"Duplicate selectors found: {selectors}"

@@ -47,11 +47,18 @@ LOW_PRIORITY_PATTERNS: list[tuple[str, float]] = [
     (r"/(category|kategoria|kategória)/[^/]+/page/\d+", 0.10),
     (r"/(author|autor)/", 0.15),
     (r"/feed/?$", 0.05),
-    (r"\.(jpg|jpeg|png|gif|svg|webp|pdf|zip|doc|docx)$", 0.00),  # binarne subory
+    # Binarne / staticke subory — nikdy ich nerenderovat ako stranky.
+    (
+        r"\.(jpg|jpeg|png|gif|webp|svg|ico|bmp|pdf|zip|doc|docx|xls|xlsx|mp4|mp3|"
+        r"css|js|xml|json|woff|woff2|ttf|eot)(\?|$)",
+        0.0,
+    ),
 ]
 
 DEFAULT_PRIORITY = 0.40
 HOMEPAGE_PRIORITY = 0.85
+# Kandidati s priority pod tymto prahom sa do crawlu vobec nedostanu (binarne subory a pod.).
+MIN_PRIORITY_TO_VISIT = 0.10
 
 # Tracking query params, ktore zahadzujeme pri normalizacii.
 _TRACKING_PARAMS = {
@@ -190,9 +197,11 @@ class CrawlerV2:
                         priority_score=self._priority_for_url(n),
                     )
 
-        # --- sort + cap -------------------------------------------------------
+        # --- filter + sort + cap ---------------------------------------------
         seed_page = discovered.get(start_norm)
         others = [p for p in discovered.values() if not seed_page or p.url != seed_page.url]
+        # Vyhod kandidatov s nulovou / takmer nulovou prioritou (binarne subory, ...).
+        others = [p for p in others if p.priority_score >= MIN_PRIORITY_TO_VISIT]
         others.sort(key=lambda p: (p.priority_score, -p.depth), reverse=True)
         result: list[DiscoveredPage] = ([seed_page] if seed_page else []) + others
         return result[: self.max_pages]
