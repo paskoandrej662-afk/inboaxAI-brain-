@@ -1,0 +1,1 @@
+done: vsetky verifikacie passed

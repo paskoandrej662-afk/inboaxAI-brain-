@@ -12,6 +12,12 @@ from app.models.brain_media_triggers import BrainMediaTrigger
 from app.models.brain_persona import BrainPersona
 from app.models.brain_summaries import BrainSummary
 from app.models.brain_tuning_changes import BrainTuningChange
+from app.models.ingest_v2 import (
+    CompanyPage,
+    IngestionCost,
+    IngestionJob,
+    RawPageBlock,
+)
 
 __all__ = [
     "AuditLog",
@@ -29,4 +35,8 @@ __all__ = [
     "BrainPersona",
     "BrainSummary",
     "BrainTuningChange",
+    "IngestionJob",
+    "CompanyPage",
+    "RawPageBlock",
+    "IngestionCost",
 ]
