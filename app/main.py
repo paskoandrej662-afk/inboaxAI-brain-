@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import coach, health, ingest, respond
+from app.api.v2 import ingest as v2_ingest
 from app.config import settings
 from app.db import close_redis_client
 
@@ -44,6 +45,7 @@ app.include_router(health.router)
 app.include_router(ingest.router)
 app.include_router(respond.router)
 app.include_router(coach.router)
+app.include_router(v2_ingest.router)
 
 
 @app.get("/")
