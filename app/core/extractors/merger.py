@@ -57,6 +57,9 @@ def merge_products(*lists: list[ExtractedProduct]) -> list[ExtractedProduct]:
                 winner.price_text = c.price_text
                 winner.price_eur = c.price_eur
                 winner.price_unit = c.price_unit
+            elif winner.price_text and c.price_text and len(c.price_text) > len(winner.price_text):
+                # Both have price_text — keep the longer one (more info, e.g. mixed pricing)
+                winner.price_text = c.price_text
             if winner.image_url is None and c.image_url:
                 winner.image_url = c.image_url
             if winner.description is None and c.description:

@@ -42,8 +42,8 @@ VISION_TOOL_SCHEMA: dict[str, Any] = {
                             "description": "Strucny popis",
                         },
                         "price_text": {
-                            "type": "string",
-                            "description": "Cena presne tak ako na stranke, napr. '160€/Den' alebo 'od 25 EUR'",
+                            "type": ["string", "null"],
+                            "description": "Volny text o cene ak nie je jednoznacna numericka hodnota. Napriklad: 'dohodou', 'na vyziadanie', 'individualne', '55€/den + doprava dohodov', 'od 100€'. Ak je cena jednoznacna numericka, nechaj null a vyplniaj len price_eur.",
                         },
                         "price_eur": {
                             "type": ["number", "null"],
@@ -160,6 +160,14 @@ PRAVIDLA:
 - Cena bez konkretneho produktu (napr. "Akcia od 99€" v hlavicke) → uloz ako fact 'tagline', NIE ako product price.
 - Atributy zachovaj v slovencine ako kluce: kapacita, rozmery, vyska, vek, materil, farba, atd.
 - Pouzi tool extract_page_data s vyplnenym JSON, ziadny iny text.
+
+DOLEZITE PRAVIDLA EXTRAKCIE:
+
+EXTRAHUJ KAZDY PRODUKT/SLUZBU ktora ma vlastne meno alebo nazov. Aj male karty (3-4 atributy) extrahuj. Aj produkty bez ceny (s price_text="dohodou" alebo null).
+NEVYNECHAJ produkty len preto, ze su mensie alebo strucnejsie. Ak ich je 10+ na strane, extrahuj ich VSETKY.
+Ak vidis cenu ktora nie je jednoznacna ('dohodou', 'na vyziadanie', 'individualne', 'cena podla rozsahu'), vyplň price_text namiesto price_eur.
+Ak vidis MIXED cenu ('55€/den + doprava dohodov'), vyplň oboje: price_eur=55, price_text="55€/den, doprava dohodov".
+Ak je produktova karta jasne viditelna (ma nazov + obrazok alebo nazov + atributy), uvedom ju aj keby si si nebol isty cenou.
 """
 
 

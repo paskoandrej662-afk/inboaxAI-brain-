@@ -10,6 +10,17 @@ logger = logging.getLogger(__name__)
 NUMBER_RE = re.compile(r'\d+[.,]?\d*')
 DIGITS_ONLY_RE = re.compile(r'\D')
 
+# Soft-pricing keywords — non-numeric prices (e.g., "dohodou", "individualne").
+# If price_text contains one of these AND the same keyword appears in page text,
+# verification passes without numeric match.
+SOFT_PRICE_KEYWORDS = (
+    'dohod',          # dohodou, dohodov, dohode
+    'na vyziadanie',
+    'na poziadanie',
+    'individual',     # individualne, individualny
+    'na vyzadanie',
+)
+
 
 def _normalize_for_match(s: str) -> str:
     """Lowercase, remove all whitespace + nbsp."""
@@ -36,7 +47,16 @@ def verify_product(p: ExtractedProduct, page_text: str) -> ExtractedProduct:
     # Verify price_text
     if p.price_text:
         price_norm = _normalize_for_match(p.price_text)
-        if price_norm and price_norm in text_norm:
+        price_text_lower = p.price_text.lower()
+        text_lower = page_text.lower()
+        soft_match = next(
+            (kw for kw in SOFT_PRICE_KEYWORDS
+             if kw in price_text_lower and kw in text_lower),
+            None,
+        )
+        if soft_match:
+            pass  # OK — soft pricing keyword verbatim in both price_text and page
+        elif price_norm and price_norm in text_norm:
             pass  # OK — full price found verbatim
         else:
             nums = NUMBER_RE.findall(p.price_text)
