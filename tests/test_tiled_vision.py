@@ -143,3 +143,17 @@ async def test_tiled_vision_handles_failed_tile():
     # Failed tile gave nothing, second tile gave "OK"
     assert len(products) == 1
     assert products[0].name == "OK"
+
+
+def test_extract_one_tile_uses_text_primary_prompt():
+    """Verify the prompt sent to Sonnet emphasizes text as primary source."""
+    from app.core.extractors.vision import _extract_one_tile
+    import inspect
+    source = inspect.getsource(_extract_one_tile)
+
+    # Must use 12000 char limit (not the old 2500)
+    assert '[:12000]' in source, "raw_text limit must be 12000 (not 2500)"
+
+    # Must instruct that text is primary source
+    assert 'Primarny zdroj' in source or 'primary source' in source.lower(), \
+        "Prompt must declare text as primary source"

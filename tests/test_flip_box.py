@@ -69,3 +69,47 @@ async def test_high_complexity_skips_flip_box():
 
     assert result['flip_boxes_expanded'] == 0
     pool._expand_flip_boxes.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_expand_flip_boxes_uses_correct_elementor_classnames():
+    """Verify _expand_flip_boxes JS targets the real Elementor classes (not BEM modifier syntax).
+
+    Real Elementor naming uses single underscore __front and __back, not double underscore
+    with modifier --front / --back.
+    """
+    from app.core.browser import BrowserPool
+    pool = BrowserPool()
+
+    # Inspect the source of the method to make sure it uses correct selectors
+    import inspect
+    source = inspect.getsource(pool._expand_flip_boxes)
+
+    # Must reference correct Elementor classes
+    assert '.elementor-flip-box__front' in source, \
+        "_expand_flip_boxes must target .elementor-flip-box__front (Elementor real naming)"
+    assert '.elementor-flip-box__back' in source, \
+        "_expand_flip_boxes must target .elementor-flip-box__back (Elementor real naming)"
+
+    # Must NOT use the wrong BEM modifier syntax
+    assert '__layer--front' not in source, \
+        "Old wrong selector __layer--front should be removed"
+    assert '__layer--back' not in source, \
+        "Old wrong selector __layer--back should be removed"
+
+
+@pytest.mark.asyncio
+async def test_expand_flip_boxes_uses_important_for_critical_styles():
+    """Verify that critical transform/visibility styles use setProperty(..., 'important')
+    to override Elementor's CSS specificity.
+    """
+    from app.core.browser import BrowserPool
+    import inspect
+    pool = BrowserPool()
+    source = inspect.getsource(pool._expand_flip_boxes)
+
+    # Critical styles must use setProperty with 'important' flag
+    assert "setProperty('transform', 'none', 'important')" in source, \
+        "transform must be set with !important to beat Elementor CSS"
+    assert "setProperty('display'" in source and "'important'" in source, \
+        "display must use setProperty with !important"

@@ -612,63 +612,78 @@ class BrowserPool:
             return 0
 
     async def _expand_flip_boxes(self, page) -> int:
-        """For Elementor Flip Box widgets: force-show the back layer (where details + prices live).
+        """For Elementor Flip Box widgets: force-show the back layer (contains prices + details).
 
-        Flip Box has 2 layers (front=image+title, back=description+price).
-        Default: only front visible. Back is rotated 180deg in CSS 3D.
+        Real Elementor classnames (verified from production HTML):
+        - .elementor-flip-box           (container parent)
+        - .elementor-flip-box__front    (front layer — image + title only)
+        - .elementor-flip-box__back     (back layer — description + price)
+        - .elementor-flip-box__layer__inner (inner wrapper)
+        - .elementor-flip-box__layer__overlay (overlay wrapper)
+        - .elementor-flip-box__layer__description (where prices live)
 
-        Strategy: stack both layers visibly OR hide front + show back.
-
-        Returns number of flip boxes modified.
+        Strategy: unflip the box (disable CSS 3D), force back layer to display:block + position:static,
+        so both front and back stack vertically in normal flow.
         """
         try:
             return await page.evaluate("""
                 () => {
                     let modified = 0;
 
-                    // Strategy: force the .elementor-flip-box parent to display both layers
-                    // by stacking them vertically (flex column) instead of CSS 3D rotation
+                    // Disable CSS 3D rotation on parent container
+                    // !important needed because Elementor's stylesheet uses !important on transform-style/perspective
                     document.querySelectorAll('.elementor-flip-box').forEach(box => {
-                        box.style.transformStyle = 'flat';
-                        box.style.perspective = 'none';
+                        box.style.setProperty('transform-style', 'flat', 'important');
+                        box.style.setProperty('perspective', 'none', 'important');
+                        box.style.setProperty('height', 'auto', 'important');
+                        box.style.setProperty('min-height', 'auto', 'important');
+                    });
+
+                    // Front layer: keep visible (image + title)
+                    document.querySelectorAll('.elementor-flip-box__front').forEach(front => {
+                        front.style.setProperty('transform', 'none', 'important');
+                        front.style.setProperty('position', 'relative', 'important');
+                        front.style.setProperty('opacity', '1', 'important');
+                        front.style.setProperty('visibility', 'visible', 'important');
+                        front.style.setProperty('backface-visibility', 'visible', 'important');
+                    });
+
+                    // Back layer: force-stack below front (where prices live)
+                    document.querySelectorAll('.elementor-flip-box__back').forEach(back => {
+                        back.style.setProperty('transform', 'none', 'important');
+                        back.style.setProperty('position', 'relative', 'important');
+                        back.style.setProperty('opacity', '1', 'important');
+                        back.style.setProperty('visibility', 'visible', 'important');
+                        back.style.setProperty('backface-visibility', 'visible', 'important');
+                        back.style.setProperty('display', 'block', 'important');
+                        back.style.setProperty('height', 'auto', 'important');
+                        back.style.setProperty('min-height', '200px', 'important');
+                        back.style.background = back.style.background || 'rgba(0, 0, 0, 0.85)';
                         modified++;
                     });
 
-                    // Front layer: keep visible (it has the image)
-                    document.querySelectorAll('.elementor-flip-box__layer--front').forEach(front => {
-                        front.style.transform = 'none';
-                        front.style.backfaceVisibility = 'visible';
-                        front.style.position = 'relative';
-                        front.style.opacity = '1';
+                    // Layer wrappers — make sure they're visible
+                    document.querySelectorAll('.elementor-flip-box__layer').forEach(layer => {
+                        layer.style.setProperty('opacity', '1', 'important');
+                        layer.style.setProperty('visibility', 'visible', 'important');
                     });
 
-                    // Back layer: force-show below the front (where prices and details live)
-                    document.querySelectorAll('.elementor-flip-box__layer--back').forEach(back => {
-                        back.style.transform = 'none';
-                        back.style.backfaceVisibility = 'visible';
-                        back.style.position = 'relative';  // not absolute
-                        back.style.opacity = '1';
-                        back.style.visibility = 'visible';
-                        back.style.height = 'auto';
-                        back.style.minHeight = '150px';
-                        back.style.display = 'block';
-                    });
-
-                    // Inner content of back layer: force visibility
+                    // Inner wrappers — these hold the actual content
                     document.querySelectorAll('.elementor-flip-box__layer__inner').forEach(inner => {
-                        inner.style.opacity = '1';
-                        inner.style.visibility = 'visible';
+                        inner.style.setProperty('opacity', '1', 'important');
+                        inner.style.setProperty('visibility', 'visible', 'important');
+                        inner.style.setProperty('display', 'block', 'important');
                     });
 
                     document.querySelectorAll('.elementor-flip-box__layer__overlay').forEach(overlay => {
-                        overlay.style.opacity = '1';
-                        overlay.style.visibility = 'visible';
+                        overlay.style.setProperty('opacity', '1', 'important');
+                        overlay.style.setProperty('visibility', 'visible', 'important');
                     });
 
                     document.querySelectorAll('.elementor-flip-box__layer__description').forEach(desc => {
-                        desc.style.opacity = '1';
-                        desc.style.visibility = 'visible';
-                        desc.style.display = 'block';
+                        desc.style.setProperty('opacity', '1', 'important');
+                        desc.style.setProperty('visibility', 'visible', 'important');
+                        desc.style.setProperty('display', 'block', 'important');
                     });
 
                     return modified;

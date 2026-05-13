@@ -380,9 +380,15 @@ async def _extract_one_tile(
     user_text = (
         f"URL: {page_url}\n"
         f"Typ stranky: {page_type}\n"
-        f"Toto je segment {tile_index + 1} z {total_tiles} (skrolovany screenshot 1280x2200 px).\n"
-        f"Mozes vidiet len cast stranky — sustred sa na produkty/sluzby/fakty viditelne v tomto segmente.\n\n"
-        f"HTML extracted text (kontext z celej stranky):\n{raw_text_excerpt[:2500]}"
+        f"Toto je segment {tile_index + 1} z {total_tiles} (skrolovany screenshot 1280x2200 px).\n\n"
+        f"DOLEZITE — Primarny zdroj pravdy je TEXT z HTML, nie screenshot.\n"
+        f"Screenshot moze mat skreslene/otocene casti (CSS animacie, transform, hover-revealed obsah).\n"
+        f"Ak vidis konflikt medzi screenshotom a textom: VERIME TEXTU.\n"
+        f"Extrahuj produkty/sluzby/fakty z textu a pouzij screenshot iba aby si pochopil rozlozenie a vztahy medzi blokmi.\n\n"
+        f"=== HTML EXTRACTED TEXT (primary source) ===\n"
+        f"{raw_text_excerpt[:12000]}\n"
+        f"=== END TEXT ===\n\n"
+        f"Teraz pozri screenshot pre vizualny kontext a vrat extract_page_data."
     )
 
     try:
