@@ -395,6 +395,10 @@ class BrowserPool:
                     const owl_count = document.querySelectorAll('.owl-carousel').length;
                     const has_js_carousel = swiper_count + slick_count + owl_count > 0;
 
+                    // Elementor Flip Box (front+back layer widget; back hidden via CSS 3D rotation)
+                    const flip_box_count = document.querySelectorAll('.elementor-flip-box').length;
+                    const has_flip_box = flip_box_count > 0;
+
                     // Swiper instance accessible via DOM property?
                     let swiper_api_available = false;
                     try {
@@ -430,6 +434,8 @@ class BrowserPool:
                         swiper_api_available: swiper_api_available,
                         accordion: details_count + role_button_collapsed > 0,
                         lazy_load: data_src_count > 0,
+                        flip_box: has_flip_box,
+                        flip_box_count: flip_box_count,
                         complexity_score: Math.min(1.0, complexity),
                     };
                 }
@@ -440,6 +446,7 @@ class BrowserPool:
                 'carousel_native': False, 'carousel_js': False,
                 'swiper_api_available': False,
                 'accordion': False, 'lazy_load': False,
+                'flip_box': False,
                 'complexity_score': 0.5,
             }
 
@@ -604,6 +611,73 @@ class BrowserPool:
             logger.debug("_dom_fallback_expand_carousels error: %s", e)
             return 0
 
+    async def _expand_flip_boxes(self, page) -> int:
+        """For Elementor Flip Box widgets: force-show the back layer (where details + prices live).
+
+        Flip Box has 2 layers (front=image+title, back=description+price).
+        Default: only front visible. Back is rotated 180deg in CSS 3D.
+
+        Strategy: stack both layers visibly OR hide front + show back.
+
+        Returns number of flip boxes modified.
+        """
+        try:
+            return await page.evaluate("""
+                () => {
+                    let modified = 0;
+
+                    // Strategy: force the .elementor-flip-box parent to display both layers
+                    // by stacking them vertically (flex column) instead of CSS 3D rotation
+                    document.querySelectorAll('.elementor-flip-box').forEach(box => {
+                        box.style.transformStyle = 'flat';
+                        box.style.perspective = 'none';
+                        modified++;
+                    });
+
+                    // Front layer: keep visible (it has the image)
+                    document.querySelectorAll('.elementor-flip-box__layer--front').forEach(front => {
+                        front.style.transform = 'none';
+                        front.style.backfaceVisibility = 'visible';
+                        front.style.position = 'relative';
+                        front.style.opacity = '1';
+                    });
+
+                    // Back layer: force-show below the front (where prices and details live)
+                    document.querySelectorAll('.elementor-flip-box__layer--back').forEach(back => {
+                        back.style.transform = 'none';
+                        back.style.backfaceVisibility = 'visible';
+                        back.style.position = 'relative';  // not absolute
+                        back.style.opacity = '1';
+                        back.style.visibility = 'visible';
+                        back.style.height = 'auto';
+                        back.style.minHeight = '150px';
+                        back.style.display = 'block';
+                    });
+
+                    // Inner content of back layer: force visibility
+                    document.querySelectorAll('.elementor-flip-box__layer__inner').forEach(inner => {
+                        inner.style.opacity = '1';
+                        inner.style.visibility = 'visible';
+                    });
+
+                    document.querySelectorAll('.elementor-flip-box__layer__overlay').forEach(overlay => {
+                        overlay.style.opacity = '1';
+                        overlay.style.visibility = 'visible';
+                    });
+
+                    document.querySelectorAll('.elementor-flip-box__layer__description').forEach(desc => {
+                        desc.style.opacity = '1';
+                        desc.style.visibility = 'visible';
+                        desc.style.display = 'block';
+                    });
+
+                    return modified;
+                }
+            """) or 0
+        except Exception as e:
+            logger.debug("_expand_flip_boxes error: %s", e)
+            return 0
+
     async def _apply_ui_expansion(self, page, url: str) -> dict:
         """Main UI expansion. FIXED execution chain. Complexity = safety gate only.
 
@@ -641,6 +715,7 @@ class BrowserPool:
             'allow_dom_mutation': allow_dom_mutation,
             'lazy_triggered': False,
             'accordions_expanded': 0,
+            'flip_boxes_expanded': 0,
             'swiper_api_cycled': 0,
             'native_scroll_cycled': 0,
             'dom_fallback_modified': 0,
@@ -654,6 +729,10 @@ class BrowserPool:
         # Step 2: Accordion (if complexity allows)
         if allow_accordion and patterns.get('accordion'):
             applied['accordions_expanded'] = await self._expand_accordions_strict(page)
+
+        # Step 2.5: Elementor Flip Box (always safe, just CSS — counts as accordion-like)
+        if allow_accordion and patterns.get('flip_box'):
+            applied['flip_boxes_expanded'] = await self._expand_flip_boxes(page)
 
         # Step 3: Carousel handling — FIXED chain
         if allow_carousel_handling:
