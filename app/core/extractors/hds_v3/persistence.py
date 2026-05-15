@@ -251,6 +251,8 @@ class HDSv3Persistence:
             name = (prod.name or "").strip()
             if not name:
                 continue
+            primary_image = getattr(prod, "image_url", None)
+            image_urls = list(getattr(prod, "image_urls", []) or [])
             yield row(
                 "product",
                 name,
@@ -265,6 +267,8 @@ class HDSv3Persistence:
                     "price_unit": getattr(prod, "price_unit", None),
                     "description": prod.description,
                     "attributes": prod.attributes,
+                    "primary_image_url": primary_image,
+                    "image_urls": image_urls,
                 },
                 evidence=prod.description or name,
                 row_source_url=prod.source_url or source_url,

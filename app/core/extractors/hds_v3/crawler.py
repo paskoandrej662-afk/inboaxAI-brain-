@@ -21,9 +21,11 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import httpx
 
 from app.core.browser import BrowserPool
+from app.core.extractors.hds_v3.image_extractor import ImageExtractor
 from app.core.extractors.hds_v3.types import (
     CrawlResult,
     DiscoveredPage,
+    PageCrawlResult,
     PagePriority,
 )
 
@@ -174,6 +176,58 @@ class HDSCrawler:
             sitemap_found=sitemap_found,
             duration_sec=time.monotonic() - start,
         )
+
+    # --------------------------------------------------------------- media streams
+    async def crawl_media_streams(
+        self, pages: list[DiscoveredPage]
+    ) -> list[PageCrawlResult]:
+        """Render each page via BrowserPool and extract its media stream.
+
+        Returns one `PageCrawlResult` per input page (in input order). On
+        per-page failure we still emit a result with empty `media_stream`
+        and the error set, so callers can correlate by URL.
+        """
+        results: list[PageCrawlResult] = []
+        if not pages:
+            return results
+
+        pool = BrowserPool()
+        try:
+            await pool.start()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("crawl_media_streams: pool.start failed: %s", e)
+            try:
+                await pool.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return [PageCrawlResult(url=p.url, error="browser_pool_failed") for p in pages]
+
+        extractor = ImageExtractor()
+        try:
+            for page in pages:
+                try:
+                    rendered = await pool.render_page(page.url, take_screenshot=False)
+                    if rendered.error or not rendered.html:
+                        results.append(
+                            PageCrawlResult(
+                                url=page.url,
+                                error=rendered.error or "empty_html",
+                            )
+                        )
+                        continue
+                    stream = extractor.extract_stream_from_html(
+                        rendered.html, base_url=rendered.final_url or page.url
+                    )
+                    results.append(PageCrawlResult(url=page.url, media_stream=stream))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("crawl_media_streams: page %s failed: %s", page.url, e)
+                    results.append(PageCrawlResult(url=page.url, error=str(e)[:200]))
+        finally:
+            try:
+                await pool.close()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("crawl_media_streams: pool.close warn: %s", e)
+        return results
 
     # --------------------------------------------------------------- manual probe
     async def _probe_kontakt(self, base_url: str) -> Optional[DiscoveredPage]:

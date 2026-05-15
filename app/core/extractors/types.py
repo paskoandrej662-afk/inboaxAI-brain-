@@ -26,6 +26,7 @@ class ExtractedProduct:
     price_unit: str | None = None
     attributes: dict[str, str] = field(default_factory=dict)
     image_url: str | None = None
+    image_urls: list[str] = field(default_factory=list)
     source_url: str = ""
     source_block_text: str = ""
     source_type: str = "vision"

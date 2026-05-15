@@ -90,6 +90,20 @@ class HdsFAQ:
 
 
 @dataclass
+class PageCrawlResult:
+    """Per-page output from `HDSCrawler.crawl_media_streams`.
+
+    `media_stream` is a linear list of images + text nodes captured from
+    the rendered page (see `app.core.extractors.hds_v3.image_extractor`).
+    Empty when rendering failed.
+    """
+
+    url: str
+    media_stream: list = field(default_factory=list)
+    error: Optional[str] = None
+
+
+@dataclass
 class GeminiExtractionResult:
     """Aggregated output of all batches for a single web ingest.
 
