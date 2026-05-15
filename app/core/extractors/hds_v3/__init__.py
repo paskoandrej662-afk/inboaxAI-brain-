@@ -11,6 +11,8 @@ from app.core.extractors.hds_v3.types import (
     DiscoveredPage,
     GeminiBatchResult,
     GeminiExtractionResult,
+    HdsExtractedFact,
+    HdsFAQ,
     PagePriority,
 )
 
@@ -19,5 +21,7 @@ __all__ = [
     "DiscoveredPage",
     "GeminiBatchResult",
     "GeminiExtractionResult",
+    "HdsExtractedFact",
+    "HdsFAQ",
     "PagePriority",
 ]

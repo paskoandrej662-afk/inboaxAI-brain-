@@ -64,6 +64,32 @@ class GeminiBatchResult:
 
 
 @dataclass
+class HdsExtractedFact:
+    """Generic fact extracted by HDS-v3 parser.
+
+    Distinct from app.core.extractors.types.ExtractedBusinessFact (key+value) —
+    this carries `type` discriminator + free-text `content` + optional `meta`
+    dict, matching the shape of the markdown sections produced by Gemini.
+
+    Engine.py maps this to ExtractedBusinessFact when persisting via knowledge_hub.
+    """
+
+    type: str  # "contact" | "address" | "info" | "social" | "geo"
+    content: str
+    source_url: Optional[str] = None
+    meta: dict = field(default_factory=dict)
+
+
+@dataclass
+class HdsFAQ:
+    """FAQ item extracted by HDS-v3 parser."""
+
+    question: str
+    answer: str
+    source_url: Optional[str] = None
+
+
+@dataclass
 class GeminiExtractionResult:
     """Aggregated output of all batches for a single web ingest.
 
