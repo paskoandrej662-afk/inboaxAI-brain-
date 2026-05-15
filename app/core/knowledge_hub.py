@@ -429,7 +429,72 @@ async def _ingest_url_vision(
                         try:
                             # NEW: tiled rendering + tiled vision
                             tiled = await browser.render_page_tiled(page_url)
-                            if tiled.segments:
+
+                            # === HDS-Lite primary extraction (2B-8) ===
+                            # Skus deterministicku DOM-segmentation engine ako prvy.
+                            # Ak uspeje, zoberieme HDS produkty a vision pipeline preskocime
+                            # pre products (vision sa stale moze pouzit pre facts/faqs/images).
+                            hds_products: list = []
+                            hds_success = False
+                            try:
+                                if tiled.segments and tiled.html:
+                                    from app.core.extractors.hds.engine import (
+                                        run_hds_extraction,
+                                    )
+                                    from app.core.extractors.types import (
+                                        ExtractedProduct,
+                                    )
+
+                                    middle_idx = len(tiled.segments) // 2
+                                    middle_screenshot = tiled.segments[middle_idx]
+                                    hds_result = await run_hds_extraction(
+                                        html=tiled.html,
+                                        screenshot_bytes=middle_screenshot,
+                                        page=None,  # Playwright Page nie je v scope; visibility best-effort
+                                        page_url=page_url,
+                                    )
+                                    logger.info(
+                                        "hds_extraction %s: success=%s cards=%d seeds=%d "
+                                        "lcas=%d candidates=%d cost=$%.4f reason=%s",
+                                        page_url,
+                                        hds_result.success,
+                                        len(hds_result.cards),
+                                        hds_result.seeds_found,
+                                        hds_result.lcas_found,
+                                        hds_result.candidate_count,
+                                        hds_result.sonnet_cost_usd,
+                                        hds_result.fallback_reason,
+                                    )
+                                    total_cost_usd += hds_result.sonnet_cost_usd
+                                    if (
+                                        hds_result.success
+                                        and len(hds_result.cards) >= 3
+                                    ):
+                                        hds_products = [
+                                            ExtractedProduct(
+                                                name=c.name,
+                                                price_eur=c.price_eur,
+                                                price_text=c.price_text,
+                                                price_unit=None,
+                                                attributes=c.attributes or {},
+                                                source_url=tiled.final_url or page_url,
+                                                source_block_text="",
+                                                source_type="hds",
+                                                confidence=c.confidence,
+                                                verified=False,
+                                            )
+                                            for c in hds_result.cards
+                                        ]
+                                        hds_success = True
+                                        vp = hds_products
+                            except Exception as e:
+                                logger.warning(
+                                    "HDS extraction failed for %s: %s — falling back to vision",
+                                    page_url,
+                                    e,
+                                )
+
+                            if not hds_success and tiled.segments:
                                 logger.info(
                                     "using tiled vision for %s (scrollHeight=%d, %d segments)",
                                     page_url,
@@ -446,7 +511,7 @@ async def _ingest_url_vision(
                                 ) = await extract_page_with_tiled_vision(
                                     tiled, page_type, raw_text
                                 )
-                            else:
+                            elif not hds_success and not tiled.segments:
                                 # Fallback na legacy single screenshot
                                 logger.warning(
                                     "tiled returned 0 segments for %s, fallback to single",
