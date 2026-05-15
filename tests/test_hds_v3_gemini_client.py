@@ -1,6 +1,7 @@
 """Tests for hds_v3 GeminiClient — offline, all API calls mocked."""
 from __future__ import annotations
 
+import inspect
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -113,3 +114,67 @@ async def test_cost_calculation():
 
     # 10k * $0.30/M + 5k * $2.50/M = 0.003 + 0.0125 = $0.0155
     assert result.total_cost_usd == pytest.approx(0.0155, abs=0.0001)
+
+
+@pytest.mark.asyncio
+async def test_response_text_fallback_to_candidates():
+    """Ak response.text je None, fallback na candidates[0].content.parts[*].text."""
+    client = GeminiClient(api_key="test-key")
+
+    fake_part = MagicMock()
+    fake_part.text = "fallback markdown content"
+
+    fake_content = MagicMock()
+    fake_content.parts = [fake_part]
+
+    fake_candidate = MagicMock()
+    fake_candidate.content = fake_content
+    fake_candidate.finish_reason = "STOP"
+
+    fake_response = MagicMock()
+    fake_response.text = None
+    fake_response.candidates = [fake_candidate]
+    fake_response.usage_metadata = MagicMock(
+        prompt_token_count=100,
+        candidates_token_count=50,
+    )
+
+    client._gemini_call = AsyncMock(return_value=fake_response)
+
+    pages = [_page("https://x.sk/")]
+    result = await client.extract_pages("https://x.sk/", pages)
+
+    assert result.success is True
+    assert "fallback markdown content" in result.batches[0].markdown
+
+
+def test_gemini_call_configures_both_grounding_tools():
+    """Regression: _gemini_call must enable BOTH google_search AND url_context.
+
+    url_context is required to actually fetch the URL contents (vs google_search
+    which only returns cached snippets). Without url_context Gemini halucinates.
+    """
+    source = inspect.getsource(GeminiClient._gemini_call)
+    assert "google_search=" in source
+    assert "url_context=" in source
+    assert "GoogleSearch()" in source
+    assert "UrlContext()" in source
+
+
+@pytest.mark.asyncio
+async def test_response_completely_empty_raises():
+    """Ak ani text ani candidates parts nie su k dispozicii, raises empty error."""
+    client = GeminiClient(api_key="test-key")
+
+    fake_response = MagicMock()
+    fake_response.text = None
+    fake_response.candidates = []
+
+    client._gemini_call = AsyncMock(return_value=fake_response)
+    client.RETRY_BACKOFF_SEC = [0, 0, 0]
+
+    pages = [_page("https://x.sk/")]
+    result = await client.extract_pages("https://x.sk/", pages)
+
+    assert result.success is False
+    assert "empty" in (result.batches[0].error or "").lower()

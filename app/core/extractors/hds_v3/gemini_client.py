@@ -37,7 +37,7 @@ class GeminiClient:
     """
 
     MODEL_NAME = "gemini-2.5-flash"
-    MAX_CONCURRENT_BATCHES = 5
+    MAX_CONCURRENT_BATCHES = 2  # Reduced from 5 — Gemini grounding rate-limits per domain
     MAX_RETRIES = 3
     RETRY_BACKOFF_SEC = [1, 3, 9]
     BATCH_TIMEOUT_SEC = 60
@@ -128,7 +128,51 @@ class GeminiClient:
                     )
 
                     text = getattr(response, "text", None) or ""
+
+                    if (
+                        not text.strip()
+                        and hasattr(response, "candidates")
+                        and response.candidates
+                    ):
+                        try:
+                            cand = response.candidates[0]
+                            if (
+                                hasattr(cand, "content")
+                                and cand.content
+                                and hasattr(cand.content, "parts")
+                            ):
+                                parts_text = []
+                                for part in cand.content.parts:
+                                    part_text = getattr(part, "text", None)
+                                    if part_text:
+                                        parts_text.append(part_text)
+                                text = "".join(parts_text)
+                                if text:
+                                    logger.info(
+                                        "Used fallback candidates[].parts[].text parsing"
+                                    )
+                        except Exception as fallback_err:  # noqa: BLE001
+                            logger.debug(
+                                "Fallback parsing failed: %s", fallback_err
+                            )
+
                     if not text.strip():
+                        finish_reason = None
+                        prompt_feedback = None
+                        if (
+                            hasattr(response, "candidates")
+                            and response.candidates
+                        ):
+                            finish_reason = getattr(
+                                response.candidates[0], "finish_reason", None
+                            )
+                        if hasattr(response, "prompt_feedback"):
+                            prompt_feedback = response.prompt_feedback
+                        logger.warning(
+                            "Empty response. finish_reason=%s, prompt_feedback=%s",
+                            finish_reason,
+                            prompt_feedback,
+                        )
                         raise ValueError("Gemini returned empty response")
 
                     result.markdown = text
@@ -191,7 +235,10 @@ class GeminiClient:
                 tools=[
                     genai_types.Tool(
                         google_search=genai_types.GoogleSearch()
-                    )
+                    ),
+                    genai_types.Tool(
+                        url_context=genai_types.UrlContext()
+                    ),
                 ],
                 temperature=0.1,
                 max_output_tokens=8192,
