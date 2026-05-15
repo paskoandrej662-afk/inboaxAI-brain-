@@ -9,7 +9,15 @@ Commit 1: crawler — najde podstranky webu z URL.
 from app.core.extractors.hds_v3.types import (
     CrawlResult,
     DiscoveredPage,
+    GeminiBatchResult,
+    GeminiExtractionResult,
     PagePriority,
 )
 
-__all__ = ["CrawlResult", "DiscoveredPage", "PagePriority"]
+__all__ = [
+    "CrawlResult",
+    "DiscoveredPage",
+    "GeminiBatchResult",
+    "GeminiExtractionResult",
+    "PagePriority",
+]

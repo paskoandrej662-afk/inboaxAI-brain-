@@ -43,3 +43,41 @@ class CrawlResult:
     sitemap_found: bool = False
     error: Optional[str] = None
     duration_sec: float = 0.0
+
+
+@dataclass
+class GeminiBatchResult:
+    """Output of single Gemini API call for 1 batch (1-3 URLs).
+
+    `markdown` is raw response — NOT parsed yet. Parser comes in Commit 3.
+    """
+
+    success: bool
+    urls: list[str]
+    markdown: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+    duration_sec: float = 0.0
+    error: Optional[str] = None
+    retry_count: int = 0
+
+
+@dataclass
+class GeminiExtractionResult:
+    """Aggregated output of all batches for a single web ingest.
+
+    This is what Commit 3 (Parser) will consume.
+    """
+
+    success: bool
+    base_url: str
+    batches: list[GeminiBatchResult] = field(default_factory=list)
+    total_batches: int = 0
+    successful_batches: int = 0
+    failed_batches: int = 0
+    total_cost_usd: float = 0.0
+    total_duration_sec: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    error: Optional[str] = None
