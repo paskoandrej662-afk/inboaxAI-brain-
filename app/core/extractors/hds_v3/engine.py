@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING
+from uuid import UUID
 
 from app.core.extractors.hds_v3.crawler import HDSCrawler
 from app.core.extractors.hds_v3.dedup import Deduplicator
@@ -14,6 +16,9 @@ from app.core.extractors.hds_v3.gemini_client import GeminiClient
 from app.core.extractors.hds_v3.parser import MarkdownParser, ParseResult
 from app.core.extractors.hds_v3.persona_generator import PersonaGenerator
 from app.core.extractors.hds_v3.validator import Validator
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -111,3 +116,35 @@ class HDSv3Engine:
             logger.exception("HDS-v3 ingest failed")
             result["error"] = str(e)[:300]
             return result
+
+    async def ingest_and_persist(
+        self,
+        base_url: str,
+        company_id: UUID,
+        session: "AsyncSession",
+    ) -> dict:
+        """Run `ingest()` then persist parsed result + persona to DB.
+
+        Returns the ingest summary with a `persist` sub-dict (see
+        `HDSv3Persistence.persist`). If ingest fails, persistence is
+        skipped and `persist` key is absent.
+        """
+        ingest_result = await self.ingest(base_url, str(company_id))
+        if not ingest_result.get("success"):
+            return ingest_result
+        if self._last_parsed is None:
+            ingest_result["persist"] = {"error": "no_parsed_result"}
+            return ingest_result
+
+        from app.core.extractors.hds_v3.persistence import HDSv3Persistence
+
+        persistence = HDSv3Persistence()
+        persist_result = await persistence.persist(
+            session=session,
+            company_id=company_id,
+            parse=self._last_parsed,
+            persona=self._last_persona or {},
+            source_url=base_url,
+        )
+        ingest_result["persist"] = persist_result
+        return ingest_result
