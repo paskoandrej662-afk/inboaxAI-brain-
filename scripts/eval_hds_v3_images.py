@@ -66,7 +66,43 @@ async def main() -> int:
         print(f"  Candidates seen:  {result.get('images_total_candidates', 0)}")
         print(f"  Products with primary: {result.get('images_matched', 0)}")
 
+    from sqlalchemy import text as sa_text
+
     async with AsyncSessionLocal() as session:
+        by_key = await session.execute(
+            sa_text(
+                "SELECT key, COUNT(*) FROM brain_facts "
+                "WHERE company_id = :cid GROUP BY key ORDER BY COUNT(*) DESC"
+            ),
+            {"cid": str(TEST_COMPANY_ID)},
+        )
+        rows_by_key = list(by_key)
+        print("\n=== DB FACTS BY KEY (after persist) ===")
+        for key, cnt in rows_by_key:
+            print(f"  {key:40} {cnt}")
+
+        product_count_res = await session.execute(
+            sa_text(
+                "SELECT COUNT(*) FROM brain_facts "
+                "WHERE company_id = :cid AND key = 'product'"
+            ),
+            {"cid": str(TEST_COMPANY_ID)},
+        )
+        product_count = product_count_res.scalar() or 0
+
+        with_image_res = await session.execute(
+            sa_text(
+                "SELECT COUNT(*) FROM brain_facts "
+                "WHERE company_id = :cid AND key = 'product' "
+                "AND value->>'primary_image_url' IS NOT NULL"
+            ),
+            {"cid": str(TEST_COMPANY_ID)},
+        )
+        with_image_db = with_image_res.scalar() or 0
+
+        print(f"\n>>> PRODUCT facts in DB: {product_count}")
+        print(f">>> Products WITH primary_image_url (DB): {with_image_db}")
+
         stmt = (
             select(BrainFact)
             .where(BrainFact.company_id == TEST_COMPANY_ID)
@@ -98,8 +134,14 @@ async def main() -> int:
     assert result.get("success"), f"Ingest failed: {result.get('error')}"
     persist = result.get("persist") or {}
     assert persist.get("error") is None, f"Persistence failed: {persist.get('error')}"
-    assert with_image >= 5, (
-        f"Expected ≥5 products with primary image, got {with_image}"
+    assert product_count >= 5, (
+        f"FATAL: only {product_count} product rows in DB (expected >= 5). "
+        "Persistence path for products is broken."
+    )
+    assert with_image_db >= 5, (
+        f"FATAL: only {with_image_db}/{product_count} product rows carry "
+        "primary_image_url in DB. In-memory shows {with_image} attached. "
+        "Image matching wired up but persistence not emitting the field."
     )
     print("\nOK: all assertions passed.")
     return 0

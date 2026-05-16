@@ -251,8 +251,21 @@ class HDSv3Persistence:
             name = (prod.name or "").strip()
             if not name:
                 continue
-            primary_image = getattr(prod, "image_url", None)
-            image_urls = list(getattr(prod, "image_urls", []) or [])
+            # Image matching may set either direct fields on the product
+            # (engine._match_images writes prod.image_url / prod.image_urls)
+            # or attributes-dict entries (older designs). Read attributes
+            # first so this is robust to either upstream.
+            prod_attrs = prod.attributes or {}
+            primary_image = (
+                prod_attrs.get("primary_image_url")
+                or getattr(prod, "primary_image_url", None)
+                or getattr(prod, "image_url", None)
+            )
+            image_urls = (
+                list(prod_attrs.get("image_urls") or [])
+                or list(getattr(prod, "image_urls", []) or [])
+                or []
+            )
             yield row(
                 "product",
                 name,
