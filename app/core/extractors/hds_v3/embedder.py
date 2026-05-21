@@ -1,10 +1,16 @@
-"""Gemini text-embedding-004 wrapper for HDS-v3 RAG.
+"""Gemini gemini-embedding-001 wrapper for HDS-v3 RAG.
 
-text-embedding-004 produces 768-dim vectors natively. The existing
-`brain_chunks.embedding` column is `vector(1536)` (OpenAI legacy schema),
-so we zero-pad 768 -> 1536 to fit. Cosine similarity is preserved under
-zero-padding (sim(a, b) == sim(pad(a), pad(b))), so retrieval ranking
-is unaffected.
+gemini-embedding-001 supports a configurable `output_dimensionality`. We
+request 1536 directly to match the existing `brain_chunks.embedding`
+column (`vector(1536)`, OpenAI legacy schema), so no padding is needed.
+
+(The previous model `text-embedding-004` was retired from the v1beta
+API — it now 404s on embedContent. `gemini-embedding-001` is the
+current replacement.)
+
+Note: for output dimensions < 3072 the API returns un-normalized
+vectors, but pgvector cosine distance (`<=>`) is scale-invariant, so
+retrieval ranking is unaffected.
 """
 from __future__ import annotations
 
@@ -14,6 +20,7 @@ import os
 from typing import Optional
 
 from google import genai
+from google.genai import types as genai_types
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +28,7 @@ logger = logging.getLogger(__name__)
 class Embedder:
     """Thin async wrapper around Gemini's text embedding endpoint."""
 
-    MODEL_NAME = "text-embedding-004"
-    NATIVE_DIM = 768
+    MODEL_NAME = "gemini-embedding-001"
     TARGET_DIM = 1536  # match brain_chunks.embedding column
     MAX_BATCH = 100
 
@@ -56,6 +62,9 @@ class Embedder:
             self.client.models.embed_content,
             model=self.MODEL_NAME,
             contents=texts,
+            config=genai_types.EmbedContentConfig(
+                output_dimensionality=self.TARGET_DIM
+            ),
         )
         embeddings = getattr(response, "embeddings", None) or []
         out: list[list[float]] = []

@@ -237,4 +237,17 @@ class HDSv3Engine:
             source_url=base_url,
         )
         ingest_result["persist"] = persist_result
+
+        # Reindex brain_chunks (Gemini embeddings) so the responder has fresh
+        # RAG context. Non-fatal: a reindex failure must not break ingest.
+        try:
+            from app.core.extractors.hds_v3.indexer import HDSv3Indexer
+
+            indexer = HDSv3Indexer()
+            reindex_result = await indexer.reindex(session, company_id)
+            ingest_result["reindex"] = reindex_result
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Reindex failed (non-fatal)")
+            ingest_result["reindex"] = {"error": str(e)[:200]}
+
         return ingest_result
